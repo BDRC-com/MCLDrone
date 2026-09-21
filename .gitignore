@@ -1,0 +1,7 @@
+checkpoints_huizhou/*
+!checkpoints_huizhou/.gitkeep
+maps/*
+!maps/.gitkeep
+test/*
+!test/.gitkeep
+__pycache__/
