@@ -40,3 +40,6 @@ ros2 launch ov_mcl mcl_localization.launch.py \
 ros2 bag record /mcl/odom /mcl/health /ov_msckf/odomimu -o $bag_out_dir
 ```
 会在`$bag_out_dir`目录下生成bag文件`mcl_replay_190020_bag_0.db3`，在`$log_out_dir`目录下生成测试结果。
+
+# 在线运行MCLDrone
+*WIP*
