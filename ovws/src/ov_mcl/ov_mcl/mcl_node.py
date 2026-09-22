@@ -51,6 +51,7 @@ import json
 import math
 import os
 import sys
+import threading
 import time
 from collections import deque
 
@@ -107,6 +108,8 @@ if GNSS_DIR not in sys.path:
     sys.path.insert(0, GNSS_DIR)
 
 import rclpy  # noqa: E402
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup  # noqa: E402
+from rclpy.executors import MultiThreadedExecutor  # noqa: E402
 from rclpy.node import Node  # noqa: E402
 from rclpy.qos import qos_profile_sensor_data  # noqa: E402
 from geometry_msgs.msg import PoseStamped  # noqa: E402
@@ -204,8 +207,11 @@ EV_HUGE = 9999.0        # covariance of a suppressed axis: EKF2 gain -> ~0
 EV_VEL_VAR = 0.04       # m^2 twist variance (VIO finite-difference ~0.2 m/s)
 EV_POS_VAR_MIN = 4.0    # m^2 pose variance floor (~2 m/axis std — the model's
                         # best-case discriminative power)
-EV_POSE_STALE_S = 1.0   # s without an mcl.step -> suppress the pose (the
-                        # estimate is dead-reckoned further than the spread)
+EV_POSE_PROP_S = 3.0    # s: max age of an MCL fix for the VIO-propagated EV
+                        # pose (fix + VIO displacement since its capture;
+                        # covers the ~0.9 s drone CNN latency + ~1 Hz fixes)
+EV_FIX_DRIFT_MPS = 1.0  # m/s: EV pose covariance growth per second of fix age
+                        # (VIO drift + yaw-error rotation of the propagation)
 EV_VEL_MAX = 20.0       # m/s horizontal plausibility gate on the VIO velocity
 EV_VZ_MAX = 10.0        # m/s vertical plausibility gate
 EV_VEL_STALE_S = 0.5    # s after which a frozen velocity is marked stale
@@ -793,6 +799,20 @@ class MclNode(Node):
         self.fcu_alt_recv = -1.0          # wall-clock time of last live sample
         self.fcu_att_seen = False         # live orientation valid, logged once
         self.fcu_alt_warned = False       # stamped-clock mismatch logged once
+        # Concurrency (the 200 Hz fusion): process_one runs the CNN (~0.9 s
+        # per frame on the Jetson) inside the DEFAULT callback group. On a
+        # single-threaded executor that starved on_odom and on_fcu_alt for
+        # the whole CNN block — measured on the drone: the perfect 200 Hz
+        # /ov_msckf/odomimu stream came out of /mcl/odom as ~90 ms bursts
+        # per cycle (~12 Hz effective). So on_odom/on_fcu_alt get their own
+        # callback groups and main() spins a MultiThreadedExecutor: they
+        # keep running while the CNN works. They mutate the pose/fcu deques
+        # from a second thread, so every cross-thread access holds
+        # buf_lock. on_image/on_imu stay in the default group: frame_q and
+        # imu_tilt then touch only the process_one thread, by design.
+        self.buf_lock = threading.Lock()
+        self.cb_vio = MutuallyExclusiveCallbackGroup()
+        self.cb_fcu = MutuallyExclusiveCallbackGroup()
         self.psi_last = 0.0               # last good yaw proxy (VIO fallback)
         self.frame_q = deque(maxlen=4)    # (k, t, gray) every stride-th frame
         self.frame_idx = 0
@@ -831,7 +851,9 @@ class MclNode(Node):
         self.ev_anchor = None           # (t, p) wide-baseline velocity anchor
         self.ev_v = None                # last good VIO velocity, base_link FLU
         self.ev_v_t = -1.0              # stamp of that velocity sample
-        self.ev_est = None              # (x, y, yaw, spread, neff) latest MCL
+        self.ev_fix = None              # (t, x, y, yaw, spread, neff, vio_p,
+                                        #  vio_R) last MEASUREMENT fix, anchored
+                                        #  at its CAPTURE time for EV propagation
         self.ev_pose_t = -1.0           # stamp of the last mcl.step
 
         self.create_subscription(Image, str(param('frame_topic',
@@ -841,11 +863,13 @@ class MclNode(Node):
                                  self.on_imu, qos_profile_sensor_data)
         self.create_subscription(Odometry, str(param('odom_topic',
                                                      '/ov_msckf/odomimu')),
-                                 self.on_odom, 10)
+                                 self.on_odom, 10,
+                                 callback_group=self.cb_vio)
         fcu_topic = str(param('fcu_alt_topic', ''))
         if fcu_topic:
             self.create_subscription(PoseStamped, fcu_topic, self.on_fcu_alt,
-                                     qos_profile_sensor_data)
+                                     qos_profile_sensor_data,
+                                     callback_group=self.cb_fcu)
         # process at most one queued frame per tick; ticks faster than the
         # expected frame rate (stride/25 Hz) so the CNN sets the pace
         self.create_timer(0.05, self.process_one)
@@ -866,14 +890,16 @@ class MclNode(Node):
         q = msg.pose.pose.orientation
         pos = np.array([p.x, p.y, p.z])
         R = quat_xyzw_to_R(q.x, q.y, q.z, q.w)
-        self.pose_t.append(t)
-        self.pose_p.append(pos)
-        self.pose_R.append(R)
-        if len(self.pose_t) > 2000:       # ~80 s at 25 Hz
-            self.pose_t.popleft()
-            self.pose_p.popleft()
-            self.pose_R.popleft()
-        self.publish_ev(msg, t, pos, R)
+        with self.buf_lock:            # pose_at / the ev_fix anchor read
+            self.pose_t.append(t)      # these on the process_one thread
+            self.pose_p.append(pos)
+            self.pose_R.append(R)
+            if len(self.pose_t) > 2000:       # ~80 s at 25 Hz
+                self.pose_t.popleft()
+                self.pose_p.popleft()
+                self.pose_R.popleft()
+        self.publish_ev(msg, t, pos, R)  # unlocked: touches only ev_* state,
+                                         # which process_one swaps atomically
 
     def publish_ev(self, msg, t, p, R_ItoG):
         """GPS-substitute EV odometry (step 4) for the PX4 EKF2 External-Vision
@@ -887,24 +913,26 @@ class MclNode(Node):
                   attitude. NOT rotated by the MCL yaw — that would make the
                   velocity channel depend on the very estimator it is
                   supposed to keep alive through an MCL loss.
-          pose  = RAW MCL estimate in the ENU map frame (x east / y north of
-                  the MAP CENTER — set the EKF2 global origin there), z=0
-                  NOT fused (baro owns altitude), published ONLY while the
-                  filter state is 'tracking'. Repeating it between the ~5 Hz
-                  filter steps is fine: the covariance (particle spread)
-                  dwarfs the per-step motion, and the EKF2 interpolates with
-                  its own prediction.
+          pose  = MCL fix VIO-propagated to NOW in the ENU map frame (x east
+                  / y north of the MAP CENTER — set the EKF2 global origin
+                  there), z=0 NOT fused (baro owns altitude), published ONLY
+                  while the filter state is 'tracking'. The fix is anchored
+                  at its CAPTURE time and carried forward with the VIO
+                  displacement (the ~0.9 s drone CNN latency would otherwise
+                  make every fix stale on arrival and the old 1.0 s rule
+                  suppressed the position 97-100% of the flight); the
+                  covariance (particle spread + age growth) tells the EKF2
+                  how much to trust it.
 
-        Honesty rules (why not pre-fuse VIO+MCL position in the node: the
-        EKF2 must see INGREDIENTS, not conclusions — pre-fused position would
-        double-count VIO (velocity is already published), and time-correlated
-        MCL errors would make the EKF2 overconfident):
-          - gated frames (coverage < SCAN_MIN_COV), stale filter (> 1 s
-            without an mcl.step), lost / recovering / pre-init -> position
-            covariance EV_HUGE: VELOCITY-ONLY messages; the EKF2 dead-reckons
-            position instead of trusting a dead or unconfirmed pose. This
-            also prevents a LOST->recovery reseed from TELEPORTING the EKF2
-            to an unconfirmed rescan hypothesis.
+        Honesty rules (the EKF2 still sees INGREDIENTS: the position is the
+        MCL measurement carried by VIO dead-reckoning, not a fused
+        conclusion — the covariance grows with the carrying time):
+          - gated frames (coverage < SCAN_MIN_COV), stale filter (> EV_POSE_
+            PROP_S without an mcl.step), lost / recovering / pre-init ->
+            position covariance EV_HUGE: VELOCITY-ONLY messages; the EKF2
+            dead-reckons position instead of trusting a dead or unconfirmed
+            pose. This also prevents a LOST->recovery reseed from TELEPORTING
+            the EKF2 to an unconfirmed rescan hypothesis.
           - VIO glitch (non-finite / |v| / tilt gates) -> velocity frozen at
             the last good sample; stale beyond EV_VEL_STALE_S -> EV_HUGE.
         """
@@ -957,14 +985,40 @@ class MclNode(Node):
         out.twist.covariance[21] = out.twist.covariance[28] = \
             out.twist.covariance[35] = EV_HUGE   # angular velocity not fused
 
-        # --- pose: raw MCL estimate, only while tracking -------------------
-        tracking = (self.particles is not None and self.ev_est is not None
+        # --- pose: MCL fix + VIO propagation to NOW, only while tracking ----
+        # The fix is ~CNN-latency old when it completes (~0.9 s on the
+        # Jetson vs ~0.2 s on dev): publishing it RAW would need a staleness
+        # window longer than the latency, and the old 1.0 s rule effectively
+        # deleted the position channel on the drone (velocity-only EV,
+        # dead-reckoned by EKF2 the whole flight). Instead anchor the fix at
+        # its CAPTURE time and add the VIO displacement since then (same
+        # composition as the particle predict step): the published position
+        # is always current and the covariance grows with the anchor age.
+        tracking = (self.particles is not None and self.ev_fix is not None
                     and not self.last_gated and not self.recovering
                     and self.lost_count == 0
-                    and t - self.ev_pose_t <= EV_POSE_STALE_S)
+                    and t - self.ev_pose_t <= EV_POSE_PROP_S)
         pc = out.pose.covariance
         if tracking:
-            x, y, yaw, spread, neff = self.ev_est
+            ft, fx, fy, yaw, spread, neff, fp, fR = self.ev_fix
+            x, y = fx, fy
+            age = t - ft
+            if fp is not None and age > 0.04:
+                # VIO displacement since the fix's capture, in the MCL body
+                # frame (CAMERA optical axes: compose the Kalibr extrinsic
+                # exactly like the predict step, R_CtoG = R_ItoG @ R_CI.T —
+                # this rig's T_cam_imu is a 180-deg z-rotation, so feeding
+                # the RAW IMU rotation negates (dx, dy) and the fix
+                # propagates BACKWARD), rotated into the map frame by the
+                # fix's MCL yaw
+                dx, dy, _ = vio_motion(fp, fR @ self.R_CI.T,
+                                       p, R_ItoG @ self.R_CI.T)
+                # plausibility gate: a VIO glitch mid-propagation must not
+                # teleport the position (the twist path gates the same glitch)
+                if math.hypot(dx, dy) <= 1.5 * EV_VEL_MAX * age + 5.0:
+                    c, s = math.cos(yaw), math.sin(yaw)
+                    x = fx + dx * c - dy * s
+                    y = fy + dx * s + dy * c
             out.pose.pose.position.x = float(x)   # ENU map frame: x east,
             out.pose.pose.position.y = float(y)   # y north of the map center
             out.pose.pose.position.z = 0.0        # z not fused (baro owns it)
@@ -977,9 +1031,11 @@ class MclNode(Node):
             out.pose.pose.orientation.w = math.cos(th / 2.0)
             # per-axis variance: spread is the 2D RADIAL RMS (=> /2 per
             # axis); neff multiplier: a near-degenerate cloud (about to be
-            # resampled) understates its uncertainty
+            # resampled) understates its uncertainty; + age growth for the
+            # VIO-propagated part (VIO drift + yaw-error rotation)
             neff_mult = max(1.0, self.n_particles / max(1.0, float(neff)))
             var_xy = max(EV_POS_VAR_MIN, 0.5 * spread * spread * neff_mult)
+            var_xy += (EV_FIX_DRIFT_MPS * max(0.0, age)) ** 2
             pc[0] = pc[7] = var_xy
         else:
             pc[0] = pc[7] = EV_HUGE
@@ -1040,28 +1096,30 @@ class MclNode(Node):
         t = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         if not self.fcu_alt_t:
             self.get_logger().info('MAVROS FCU altitude active (live baro)')
-        self.fcu_alt_t.append(t)
-        self.fcu_alt_z.append(float(msg.pose.position.z))
-        q = msg.pose.orientation
-        n2 = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w
-        if n2 > 0.25:                # orientation filled (not all-zero)
-            roll, pitch = mavros_enu_tilt(q.x, q.y, q.z, q.w, self.R_fcu2cam)
-            self.fcu_roll.append(roll)
-            self.fcu_pitch.append(pitch)
-            hdg = enu_quat_to_ned_heading(q.x, q.y, q.z, q.w)
-            for prev in reversed(self.fcu_hdg_vals):  # unwrap vs last finite
-                if np.isfinite(prev):
-                    hdg = prev + wrap_angle(hdg - prev)
-                    break
-            self.fcu_hdg_vals.append(hdg)
-            if not self.fcu_att_seen:
-                self.fcu_att_seen = True
-                self.get_logger().info(
-                    'MAVROS FCU attitude active (live EKF tilt + heading)')
-        else:
-            self.fcu_roll.append(float('nan'))
-            self.fcu_pitch.append(float('nan'))
-            self.fcu_hdg_vals.append(float('nan'))
+        with self.buf_lock:          # live_fcu_* readers run in process_one
+            self.fcu_alt_t.append(t)
+            self.fcu_alt_z.append(float(msg.pose.position.z))
+            q = msg.pose.orientation
+            n2 = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w
+            if n2 > 0.25:                # orientation filled (not all-zero)
+                roll, pitch = mavros_enu_tilt(q.x, q.y, q.z, q.w,
+                                               self.R_fcu2cam)
+                self.fcu_roll.append(roll)
+                self.fcu_pitch.append(pitch)
+                hdg = enu_quat_to_ned_heading(q.x, q.y, q.z, q.w)
+                for prev in reversed(self.fcu_hdg_vals):  # unwrap vs last
+                    if np.isfinite(prev):
+                        hdg = prev + wrap_angle(hdg - prev)
+                        break
+                self.fcu_hdg_vals.append(hdg)
+                if not self.fcu_att_seen:
+                    self.fcu_att_seen = True
+                    self.get_logger().info(
+                        'MAVROS FCU attitude active (live EKF tilt + heading)')
+            else:
+                self.fcu_roll.append(float('nan'))
+                self.fcu_pitch.append(float('nan'))
+                self.fcu_hdg_vals.append(float('nan'))
         self.fcu_alt_recv = time.time()
 
     def live_fcu_alt(self, t):
@@ -1072,27 +1130,28 @@ class MclNode(Node):
         fresh data IS arriving, falls back to the newest sample — the baro
         changes slowly, so ~1 s staleness is harmless for the ortho scale
         (and strictly better than the VIO-z fallback)."""
-        if not self.fcu_alt_t:
+        with self.buf_lock:         # on_fcu_alt appends on its own thread
+            if not self.fcu_alt_t:
+                return None
+            ts = list(self.fcu_alt_t)
+            zs = list(self.fcu_alt_z)
+            import bisect
+            i = bisect.bisect_left(ts, t)
+            lo, hi = max(0, i - 1), min(len(ts) - 1, i)
+            near = min(abs(ts[lo] - t), abs(ts[hi] - t))
+            if near <= FCU_ALT_MAX_AGE:
+                if ts[hi] == ts[lo]:
+                    return zs[lo]
+                f = min(max((t - ts[lo]) / (ts[hi] - ts[lo]), 0.0), 1.0)
+                return zs[lo] * (1.0 - f) + zs[hi] * f
+            if time.time() - self.fcu_alt_recv < 2.0:
+                if not self.fcu_alt_warned:
+                    self.fcu_alt_warned = True
+                    self.get_logger().warn(
+                        'FCU altitude stamps do not match the camera clock '
+                        '(MAVROS timesync off?) — using newest sample')
+                return zs[-1]
             return None
-        ts = list(self.fcu_alt_t)
-        zs = list(self.fcu_alt_z)
-        import bisect
-        i = bisect.bisect_left(ts, t)
-        lo, hi = max(0, i - 1), min(len(ts) - 1, i)
-        near = min(abs(ts[lo] - t), abs(ts[hi] - t))
-        if near <= FCU_ALT_MAX_AGE:
-            if ts[hi] == ts[lo]:
-                return zs[lo]
-            f = min(max((t - ts[lo]) / (ts[hi] - ts[lo]), 0.0), 1.0)
-            return zs[lo] * (1.0 - f) + zs[hi] * f
-        if time.time() - self.fcu_alt_recv < 2.0:
-            if not self.fcu_alt_warned:
-                self.fcu_alt_warned = True
-                self.get_logger().warn(
-                    'FCU altitude stamps do not match the camera clock '
-                    '(MAVROS timesync off?) — using newest sample')
-            return zs[-1]
-        return None
 
     def fcu_alt_at(self, t):
         """FCU baro height (m) at image time t — ONE source abstraction for
@@ -1112,23 +1171,24 @@ class MclNode(Node):
         No fresh-sample fallback (unlike the altitude): tilt changes fast
         during turns, and a wrong tilt is worse than falling back to the
         VIO attitude — on stamp mismatch the caller uses VIO instead."""
-        if not self.fcu_att_seen or not self.fcu_alt_t:
-            return None
-        ts = list(self.fcu_alt_t)
-        rs = list(self.fcu_roll)
-        ps = list(self.fcu_pitch)
-        import bisect
-        i = bisect.bisect_left(ts, t)
-        lo, hi = max(0, i - 1), min(len(ts) - 1, i)
-        near = min(abs(ts[lo] - t), abs(ts[hi] - t))
-        if near > FCU_ATT_MAX_AGE or not (np.isfinite(rs[lo]) and
-                                          np.isfinite(rs[hi])):
-            return None
-        if ts[hi] == ts[lo]:
-            return rs[lo], ps[lo]
-        f = min(max((t - ts[lo]) / (ts[hi] - ts[lo]), 0.0), 1.0)
-        return (rs[lo] * (1.0 - f) + rs[hi] * f,
-                ps[lo] * (1.0 - f) + ps[hi] * f)
+        with self.buf_lock:         # on_fcu_alt appends on its own thread
+            if not self.fcu_att_seen or not self.fcu_alt_t:
+                return None
+            ts = list(self.fcu_alt_t)
+            rs = list(self.fcu_roll)
+            ps = list(self.fcu_pitch)
+            import bisect
+            i = bisect.bisect_left(ts, t)
+            lo, hi = max(0, i - 1), min(len(ts) - 1, i)
+            near = min(abs(ts[lo] - t), abs(ts[hi] - t))
+            if near > FCU_ATT_MAX_AGE or not (np.isfinite(rs[lo]) and
+                                              np.isfinite(rs[hi])):
+                return None
+            if ts[hi] == ts[lo]:
+                return rs[lo], ps[lo]
+            f = min(max((t - ts[lo]) / (ts[hi] - ts[lo]), 0.0), 1.0)
+            return (rs[lo] * (1.0 - f) + rs[hi] * f,
+                    ps[lo] * (1.0 - f) + ps[hi] * f)
 
     def fcu_tilt_at(self, t):
         """FCU EKF attitude tilt (roll, pitch) at image time t — replay/live
@@ -1143,21 +1203,22 @@ class MclNode(Node):
         """NED heading (rad, unwrapped) at image time t from the live MAVROS
         deque, or None. Same stamp-matched interpolation as the tilt; no
         fresh-sample fallback (a wrong heading mis-steers every scan)."""
-        if not self.fcu_att_seen or not self.fcu_alt_t:
-            return None
-        ts = list(self.fcu_alt_t)
-        hs = list(self.fcu_hdg_vals)
-        import bisect
-        i = bisect.bisect_left(ts, t)
-        lo, hi = max(0, i - 1), min(len(ts) - 1, i)
-        near = min(abs(ts[lo] - t), abs(ts[hi] - t))
-        if near > FCU_ATT_MAX_AGE or not (np.isfinite(hs[lo])
-                                          and np.isfinite(hs[hi])):
-            return None
-        if ts[hi] == ts[lo]:
-            return hs[lo]
-        f = min(max((t - ts[lo]) / (ts[hi] - ts[lo]), 0.0), 1.0)
-        return hs[lo] * (1.0 - f) + hs[hi] * f
+        with self.buf_lock:         # on_fcu_alt appends on its own thread
+            if not self.fcu_att_seen or not self.fcu_alt_t:
+                return None
+            ts = list(self.fcu_alt_t)
+            hs = list(self.fcu_hdg_vals)
+            import bisect
+            i = bisect.bisect_left(ts, t)
+            lo, hi = max(0, i - 1), min(len(ts) - 1, i)
+            near = min(abs(ts[lo] - t), abs(ts[hi] - t))
+            if near > FCU_ATT_MAX_AGE or not (np.isfinite(hs[lo])
+                                              and np.isfinite(hs[hi])):
+                return None
+            if ts[hi] == ts[lo]:
+                return hs[lo]
+            f = min(max((t - ts[lo]) / (ts[hi] - ts[lo]), 0.0), 1.0)
+            return hs[lo] * (1.0 - f) + hs[hi] * f
 
     def hdg_at(self, t):
         """FCU EKF NED heading (rad, unwrapped) at image time t — replay/live
@@ -1193,20 +1254,24 @@ class MclNode(Node):
         self.frame_idx += 1
 
     def pose_at(self, t):
-        """Index of the nearest odomimu pose within POSE_MAX_AGE, else None."""
-        if not self.pose_t:
-            return None
-        ts = list(self.pose_t)            # bisect needs random access list
-        import bisect
-        i = bisect.bisect_left(ts, t)
-        best = None
-        for j in (i - 1, i):
-            if 0 <= j < len(ts):
-                if best is None or abs(ts[j] - t) < abs(ts[best] - t):
-                    best = j
-        if best is None or abs(ts[best] - t) > POSE_MAX_AGE:
-            return None
-        return best
+        """Nearest odomimu pose within POSE_MAX_AGE as (p_IinG, R_ItoG),
+        else None. Returns the values (not a deque index) under buf_lock: an
+        index would be invalidated by on_odom's popleft on the other thread
+        before the caller could use it."""
+        with self.buf_lock:
+            if not self.pose_t:
+                return None
+            ts = list(self.pose_t)        # bisect needs random access list
+            import bisect
+            i = bisect.bisect_left(ts, t)
+            best = None
+            for j in (i - 1, i):
+                if 0 <= j < len(ts):
+                    if best is None or abs(ts[j] - t) < abs(ts[best] - t):
+                        best = j
+            if best is None or abs(ts[best] - t) > POSE_MAX_AGE:
+                return None
+            return self.pose_p[best], self.pose_R[best]
 
     # ------------------------------------------------------------ scans
     def steered_global_scan(self):
@@ -1367,9 +1432,9 @@ class MclNode(Node):
         #            when SchurVINS diverges) -> ignore; patch still saved
         p = R_CtoG = None
         vio = 'bad'
-        i = self.pose_at(t)
-        if i is not None:
-            pv, R_ItoG = self.pose_p[i], self.pose_R[i]
+        pr = self.pose_at(t)
+        if pr is not None:
+            pv, R_ItoG = pr
             Rv = R_ItoG @ self.R_CI.T
             vr, vpi = camera_tilt(Rv)
             va = float(pv[2]) + self.alt_anchor
@@ -1721,10 +1786,21 @@ class MclNode(Node):
             skip_update=gated)
         self.particles = particles
         # cache for the EV odometry publisher (publish_ev, ~25 Hz in on_odom):
-        # the raw estimate + the honest per-axis covariance inputs. Validity
-        # flags (last_gated / recovering / lost_count) are read live.
-        self.ev_est = (est['x'], est['y'], est['yaw'],
-                       est['spread'], self.mcl.last_neff)
+        # the fix + the honest per-axis covariance inputs. Validity flags
+        # (last_gated / recovering / lost_count) are read live. Anchored at
+        # the frame's CAPTURE time with the VIO pose of that instant, so
+        # publish_ev can propagate it to NOW (the fix is ~CNN-latency old
+        # when it completes). Only MEASUREMENT frames anchor — a gated frame
+        # predicts only and carries no fresh information.
+        if not gated:
+            p_fix = R_fix = None
+            with self.buf_lock:    # on_odom appends on its own thread
+                if len(self.pose_t):
+                    j = int(np.argmin(np.abs(np.asarray(self.pose_t) - t)))
+                    if abs(self.pose_t[j] - t) <= 0.1:
+                        p_fix, R_fix = self.pose_p[j], self.pose_R[j]
+            self.ev_fix = (t, est['x'], est['y'], est['yaw'],
+                           est['spread'], self.mcl.last_neff, p_fix, R_fix)
         self.ev_pose_t = t
 
         if self.save_debug and k % self.debug_stride == 0:
@@ -2093,8 +2169,14 @@ class MclNode(Node):
 def main():
     rclpy.init()
     node = MclNode()
+    # MultiThreadedExecutor: process_one blocks the default callback group for
+    # ~0.9 s per frame (CNN); on_odom's own group keeps publishing the 200 Hz
+    # VIO-carried EV odometry during that time. A single-threaded spin
+    # starved it to ~90 ms bursts per cycle on the drone (12 Hz effective).
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:

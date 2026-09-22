@@ -304,17 +304,25 @@ def land_timeout():
 
 
 def vio_drop_grace():
-    """A VIO dropout is tolerated for vio_grace_s (from first appearance)."""
-    s = Sim(vio_grace_s=3.0)
-    s.step(0.1)
-    s.step(0.1, alt=50.0)
-    vio = {'state': 'tracking', 'vio': 'drop'}
-    s.step(0.1, health=vio)                # condition appears
-    s.step(3.0, health=vio)                # 3.0 not > 3
-    s.step(0.5, health=vio)                # 3.5 > 3
-    return expect('vio drop grace 3 s -> HOLD', s, [
-        (WAIT, 'wait_ev'), (TAKEOFF, 'armed_offboard'),
-        (MISSION, 'altitude_reached'), (HOLD, 'degraded:vio_drop')])
+    """A VIO dropout is tolerated for vio_grace_s (from first appearance).
+
+    Also pins the REAL mcl_node vocabulary: the node classifies VIO as
+    {'none','ok','resume','bad'} — 'bad' (diverged SchurVINS) is what a VIO
+    death actually reports. 'drop' is the original step-5 name, kept working.
+    """
+    results = []
+    for tag, val in (('drop', 'drop'), ('bad', 'bad')):
+        s = Sim(vio_grace_s=3.0)
+        s.step(0.1)
+        s.step(0.1, alt=50.0)
+        vio = {'state': 'tracking', 'vio': val}
+        s.step(0.1, health=vio)            # condition appears
+        s.step(3.0, health=vio)            # 3.0 not > 3
+        s.step(0.5, health=vio)            # 3.5 > 3
+        results.append(expect('vio %s grace 3 s -> HOLD' % tag, s, [
+            (WAIT, 'wait_ev'), (TAKEOFF, 'armed_offboard'),
+            (MISSION, 'altitude_reached'), (HOLD, 'degraded:vio_drop')]))
+    return all(results)
 
 
 def motion_only_grace():

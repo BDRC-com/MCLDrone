@@ -41,5 +41,14 @@ ros2 bag record /mcl/odom /mcl/health /ov_msckf/odomimu -o $bag_out_dir
 ```
 会在`$bag_out_dir`目录下生成bag文件`mcl_replay_190020_bag_0.db3`，在`$log_out_dir`目录下生成测试结果。
 
+## 3. 可视化Odometry和GPS Truth
+```bash
+python3 ~/MCLDrone/plot_odom_vs_gps.py \
+    $log_out_dir \  # MCL run directory
+    --bag $bag_out_dir \  # Odometry records
+    --fly ~/datasets/bag_0001_20260831_184004  # GPS truth
+```
+会在`$log_out_dir`目录下生成可视化结果。
+
 # 在线运行MCLDrone
 *WIP*

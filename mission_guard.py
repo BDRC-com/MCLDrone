@@ -115,7 +115,11 @@ class Guard:
             cond, grace = 'ev_stale', 0.0
         elif health is None:
             pass                          # no health topic: EV freshness only
-        elif health.get('vio') == 'drop':
+        elif health.get('vio') in ('drop', 'bad'):
+            # mcl_node classifies every processed frame's VIO as one of
+            # {'none', 'ok', 'resume', 'bad'} — 'bad' = missing/catastrophic
+            # (diverged SchurVINS, z to -11 km observed on bag 190020).
+            # 'drop' is kept for back-compat with the original step-5 tests.
             cond, grace = 'vio_drop', self.vio_grace_s
         else:
             st = str(health.get('state', 'no_frames'))

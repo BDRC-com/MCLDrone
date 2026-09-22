@@ -208,7 +208,14 @@ class MCL:
         cumsum = np.cumsum(w)
         cumsum[-1] = 1.0  # guard against float drift
         idx = np.clip(np.searchsorted(cumsum, positions), 0, N - 1)
-        return {k: v[idx] for k, v in particles.items()}
+        out = {k: v[idx] for k, v in particles.items()}
+        # Resampled particles are exchangeable: reset the weights to 1/N
+        # (standard PF). Keeping the resampled weights leaves sum(w) != 1,
+        # which scales the weighted-mean estimate by ~N/neff on the next
+        # skip_update (gated) frame — the ~700 m estimate teleport seen at
+        # the coverage gate in the drone replays.
+        out["w"] = np.full(N, 1.0 / N, dtype=w.dtype)
+        return out
 
     @staticmethod
     def roughen(particles, std, decay=1.0):
