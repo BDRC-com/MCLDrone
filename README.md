@@ -4,9 +4,24 @@
 git clone https://github.com/Mastopke304/MCLDrone.git
 cd MCLDrone
 
-# Conda
-conda env create -f environment.yml
+# Conda 训练环境
+conda env create -f environment_sivl.yml
+# MCL 运行环境
+# 需要先安装ROS2 Humble 和 MicroXRCE-DDS agent，然后：
+sudo apt install -y python3-opencv python3-matplotlib python3-scipy python3-pandas \
+  python3-yaml python3-pip python3-setuptools python3-colcon-common-extensions
+# 然后安装环境：
+source /opt/ros/humble/setup.bash
+sudo /usr/bin/python3 -m pip install -r ~/MCLDrone/requirements_drone.txt
+/usr/bin/python3 - <<'EOF'
+import torch, numpy as np, cv2
+assert torch.cuda.is_available(), "torch must see CUDA (JetPack wheel)"
+print(torch.__version__, "cuda", torch.version.cuda, "numpy", np.__version__)
+EOF
+# 应出现: 2.5.0a0+...nv24.08 cuda 12.6 numpy 1.26.x
 ```
+如果`pip`失败因为 PEP-668，需要添加`--break-system-packages`参数；不要让它升级`numpy`到2.x（检查安装后是否成功）。
+
 创建好环境后，需要将如下文件放置在制定地点：
 ```bash
 # 模型权重 huizhou_ft_mt_1_epoch_040_of_40.pt
@@ -16,6 +31,7 @@ cd maps/
 # ov_SchurVINS
 cd ovws/src/
 git clone https://github.com/BDRC-com/ov_SchurVINS.git
+# Build
 cd ~/MCLDrone/ovws/
 colcon build
 ```
