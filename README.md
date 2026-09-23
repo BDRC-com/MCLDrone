@@ -20,7 +20,7 @@ print(torch.__version__, "cuda", torch.version.cuda, "numpy", np.__version__)
 EOF
 # 应出现: 2.5.0a0+...nv24.08 cuda 12.6 numpy 1.26.x
 ```
-如果`pip`失败因为 PEP-668，需要添加`--break-system-packages`参数；不要让它升级`numpy`到2.x（检查安装后是否成功）。
+如果`pip`因为 PEP-668 失败，需要添加`--break-system-packages`参数；不要让它升级`numpy`到2.x（检查安装后是否成功）。
 
 创建好环境后，需要将如下文件放置在制定地点：
 ```bash
