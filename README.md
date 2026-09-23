@@ -50,5 +50,35 @@ python3 ~/MCLDrone/plot_odom_vs_gps.py \
 ```
 会在`$log_out_dir`目录下生成可视化结果。
 
-# 在线运行MCLDrone
-*WIP*
+# 在线运行MCLDrone并录制包
+## 1. 启动摄像机
+```bash
+# Terminal 1
+ssh ros2@192.168.1200
+export ROS_DOMAIN_ID=0
+source /opt/ros/$ROS2_DISTRO/setup.bash
+source ~/MCLDrone/ovws/install/setup.bash
+nohup ~/start_camera.sh > /tmp/camera_bridge.log 2>&1 & disown
+ros2 topic hz /imu0 # 检查IMU话题频率
+```
+
+## 2. 启动MCLDrone
+```bash
+# Terminal 1
+~/MCLDrone/run_live.sh --name flight01 --daemon \
+  --map ~/MCLDrone/maps/z17_5120.png \
+  --lat 22.842897 --lon 114.525573 # 起飞点的经纬度
+```
+
+## 3. 重新连接后检查
+```bash
+# Terminal 2
+~/MCLDrone/run_live.sh --name flight01 --status
+tail -f /tmp/run_live_flight01.console.log
+```
+
+## 4. 结束录制
+```bash
+# Terminal 2
+~/MCLDrone/run_live.sh --name flight01 --stop
+```

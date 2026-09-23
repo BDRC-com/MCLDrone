@@ -68,12 +68,24 @@ def import_bag_gps_truth(script_dir):
 
 
 def read_ev_bag(bag_dir, ev_topic):
-    import rosbag2_py
+    try:
+        import rosbag2_py
+    except ImportError:
+        raise SystemExit(
+            "rosbag2_py not found for %s. ROS Jazzy bindings are built for "
+            "the SYSTEM python3.12 — a conda/venv interpreter (e.g. sivl, "
+            "3.11) cannot load them. Run:\n"
+            "  source /opt/ros/jazzy/setup.bash && /usr/bin/python3 %s ...\n"
+            "(or 'conda deactivate' first)."
+            % (sys.executable, os.path.abspath(__file__)))
     from rclpy.serialization import deserialize_message
     from rosidl_runtime_py.utilities import get_message
 
+    # Jazzy ros2 bag record defaults to mcap; older recordings are sqlite3
+    sid = 'mcap' if glob.glob(os.path.join(bag_dir, '*.mcap')) \
+        else 'sqlite3'
     r = rosbag2_py.SequentialReader()
-    r.open(rosbag2_py.StorageOptions(uri=bag_dir, storage_id='sqlite3'),
+    r.open(rosbag2_py.StorageOptions(uri=bag_dir, storage_id=sid),
            rosbag2_py.ConverterOptions('', ''))
     cls = {t.name: get_message(t.type)
            for t in r.get_all_topics_and_types()}
@@ -106,7 +118,9 @@ def load_fixes(run_dir):
 def guess_bag_dir(run_dir):
     root = os.path.dirname(os.path.dirname(os.path.abspath(run_dir)))
     cands = [d for d in glob.glob(os.path.join(root, 'mcl_replay_*'))
-             if os.path.isdir(d) and glob.glob(os.path.join(d, '*.db3'))]
+             if os.path.isdir(d)
+             and (glob.glob(os.path.join(d, '*.db3'))
+                  or glob.glob(os.path.join(d, '*.mcap')))]
     if not cands:
         return None
     return max(cands, key=os.path.getmtime)

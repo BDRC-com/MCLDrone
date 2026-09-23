@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!--
+  FastDDS profile: UDP loopback ONLY (shared-memory transport disabled).
+
+  Applied to the SMALL-MESSAGE recorder in run_live.sh. FastDDS 2.6 SHM
+  sheds bursty high-rate best-effort streams (observed on this rig: /imu0
+  published ~195 Hz in ~50 ms bursts but recorded at only ~45-55 Hz,
+  /ov_msckf/odomimu ~85 Hz vs ~186 Hz published, while 50/100 Hz FCU topics
+  were complete) even when the image recorder runs in a separate process.
+  UDP on the loopback interface carries 200 Hz small messages easily.
+  Do NOT use this for camera images (360 KB x 50 Hz) — those stay on SHM.
+-->
+<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <transport_descriptors>
+    <transport_descriptor>
+      <transport_id>udp_lo</transport_id>
+      <type>UDPv4</type>
+    </transport_descriptor>
+  </transport_descriptors>
+  <participant profile_name="udp_only" is_default_profile="true">
+    <rtps>
+      <userTransports>
+        <transport_id>udp_lo</transport_id>
+      </userTransports>
+      <useBuiltinTransports>false</useBuiltinTransports>
+    </rtps>
+  </participant>
+</profiles>

@@ -215,6 +215,24 @@ EV_FIX_DRIFT_MPS = 1.0  # m/s: EV pose covariance growth per second of fix age
 EV_VEL_MAX = 20.0       # m/s horizontal plausibility gate on the VIO velocity
 EV_VZ_MAX = 10.0        # m/s vertical plausibility gate
 EV_VEL_STALE_S = 0.5    # s after which a frozen velocity is marked stale
+EV_JUMP_MPS = 35.0     # m/s: delivered-fix implied-speed ceiling (a fix
+EV_JUMP_M = 8.0        # sequence cannot beat physics). A larger jump with
+                       # no rescan-confirm marker is a filter teleport:
+                       # NaN the pose until a confirmed reseed re-links it
+                       # (bag 190020: a CONFIRMED false lock fed EKF2
+                       # 205 m-wrong fixes for 25 s)
+DR_TOL = (30.0, 1.0, 0.05)   # rescan-nominee gate tolerance [m] since
+                             # last_good: base + rate*t + quad*t*t (velocity-
+                             # integration drift ~ rate, compass-yaw rotation
+                             # of the integral ~ quad)
+DR_TOL_MAX = 120.0      # m: cap on the above — uncapped it is vacuous by
+                        # DR_GATE_MAX_S; 120 m still blocks the bag-190020
+                        # lookalikes (103-195 m off) while truth passes
+                        # (<= 72 m over the 110 s false-lock episode)
+DR_GATE_MAX_S = 120.0   # s: beyond this lost window the DR reference is
+                        # vacuous — gate skipped
+DR_GATE_MAX_BLOCKS = 3  # fully-blocked rescans before the gate gives up
+                        # (a broken DR stream must not wedge recovery)
 
 POSE_MAX_AGE = 0.15   # s: max |odomimu stamp - image stamp| for a match
 FCU_ALT_MAX_AGE = 1.0  # s: max |FCU altitude stamp - image stamp| (baro is
@@ -560,15 +578,17 @@ class ImuTilt:
 
 
 def bag_fcu_streams(bag_dir, R_fcu2cam):
-    """FCU baro height, EKF attitude tilt AND NED heading vs the BAG clock,
-    from the ULog beside the bag, clock-aligned by the gyro-z / attitude
-    yaw-rate correlation (ulog_t = bag_t + off, same method as
-    bag_gps_truth). The flight-controller EKF handles this airframe's heavy
-    prop vibration (the raw /imu0 accelerometer does NOT: |a-g| p50
-    7.4 m/s^2), so its attitude is the tilt source for the orthoprojection.
-    Returns (alt_at, tilt_at, hdg_at): callables bag_t -> height m /
-    (roll, pitch) camera-frame / NED heading rad (unwrapped); all None
-    when the bag has no ULog or the correlation is too weak."""
+    """FCU baro height, EKF attitude tilt, NED heading AND local-frame
+    horizontal velocity vs the BAG clock, from the ULog beside the bag,
+    clock-aligned by the gyro-z / attitude yaw-rate correlation (ulog_t =
+    bag_t + off, same method as bag_gps_truth). The flight-controller EKF
+    handles this airframe's heavy prop vibration (the raw /imu0
+    accelerometer does NOT: |a-g| p50 7.4 m/s^2), so its attitude is the
+    tilt source for the orthoprojection and its velocity is the DR-gate
+    integration source. Returns (alt_at, tilt_at, hdg_at, vel_at):
+    callables bag_t -> height m / (roll, pitch) camera-frame / NED heading
+    rad (unwrapped) / (v_east, v_north) m/s; all None when the bag has no
+    ULog or the correlation is too weak."""
     import glob
     import sqlite3
     from pyulog import ULog
@@ -577,9 +597,9 @@ def bag_fcu_streams(bag_dir, R_fcu2cam):
     ulgs = sorted(glob.glob(os.path.join(bag_dir, '*.ulg')))
     db3s = sorted(glob.glob(os.path.join(bag_dir, '*.db3')))
     if not ulgs or not db3s:
-        return None, None, None
+        return None, None, None, None
     u = ULog(ulgs[0])
-    att = alt = None
+    att = alt = vel = None
     for d in u.data_list:
         if d.name == 'vehicle_attitude' and att is None:
             t = d.data['timestamp'] / 1e6
@@ -604,16 +624,20 @@ def bag_fcu_streams(bag_dir, R_fcu2cam):
             g_frd = np.einsum('nji,j->ni', R_wb, np.array([0., 0., 1.]))
             att = (t, np.unwrap(yaw), g_frd)
         elif d.name == 'vehicle_local_position' and alt is None:
-            ok = np.isfinite(d.data['z'])
+            ok = (np.isfinite(d.data['z']) & np.isfinite(d.data['vx'])
+                  & np.isfinite(d.data['vy']))
             alt = (d.data['timestamp'][ok] / 1e6, -d.data['z'][ok])
-    if att is None or alt is None:
-        return None, None, None
+            vel = (d.data['timestamp'][ok] / 1e6,   # ulog clock, s
+                   d.data['vy'][ok],                # east  = local NED y
+                   d.data['vx'][ok])                # north = local NED x
+    if att is None or alt is None or vel is None:
+        return None, None, None, None
 
     db = sqlite3.connect(f'file:{db3s[0]}?mode=ro', uri=True)
     try:
         tid = dict(db.execute('SELECT name,id FROM topics')).get('/imu0')
         if tid is None:
-            return None, None, None
+            return None, None, None, None
         rows = db.execute(
             'SELECT timestamp,data FROM messages WHERE topic_id=? '
             'ORDER BY timestamp', (tid,)).fetchall()
@@ -640,9 +664,10 @@ def bag_fcu_streams(bag_dir, R_fcu2cam):
         if c > bc:
             bc, bo = c, off
     if bc < 0.3:
-        return None, None, None
+        return None, None, None, None
     ta, za = alt
     tg, g_frd = att[0], att[2]
+    tv, vE, vN = vel
 
     def alt_at(t_bag):
         return float(np.interp(t_bag, ta - bo, za))
@@ -655,7 +680,14 @@ def bag_fcu_streams(bag_dir, R_fcu2cam):
     def hdg_at(t_bag):
         return float(np.interp(t_bag + bo, tg, att[1]))
 
-    return alt_at, tilt_at, hdg_at
+    def vel_at(t_bag):
+        tu = t_bag + bo
+        if tu < tv[0] + 0.5 or tu > tv[-1] - 0.5:
+            return None               # no silent clamping at the edges
+        return (float(np.interp(tu, tv, vE)),
+                float(np.interp(tu, tv, vN)))
+
+    return alt_at, tilt_at, hdg_at, vel_at
 
 
 class MclNode(Node):
@@ -790,9 +822,12 @@ class MclNode(Node):
         self.fcu_alt = None               # cached alt_at(bag_t) callable
         self.fcu_tilt = None              # cached tilt_at(bag_t) callable
         self.fcu_hdg = None               # cached hdg_at(bag_t) callable
+        self.fcu_vel = None               # cached vel_at(bag_t) callable
         self.fcu_tried = False            # ULog parse attempted (replay)
         self.fcu_alt_t = deque(maxlen=3000)  # live FCU altitude stamps (~60 s)
         self.fcu_alt_z = deque(maxlen=3000)  # live FCU height, m (ENU, up)
+        self.fcu_px = deque(maxlen=3000)  # live FCU ENU x, m (velocity DR)
+        self.fcu_py = deque(maxlen=3000)  # live FCU ENU y, m (velocity DR)
         self.fcu_roll = deque(maxlen=3000)   # live FCU camera roll (rad)
         self.fcu_pitch = deque(maxlen=3000)  # live FCU camera pitch (rad)
         self.fcu_hdg_vals = deque(maxlen=3000)  # live FCU NED heading, unwrapped
@@ -844,6 +879,7 @@ class MclNode(Node):
                        'x': None, 'y': None, 'yaw_deg': None, 'score': None,
                        'spread': None, 'neff': None, 'coverage': None,
                        'alt': None, 'vio': 'none', 'innov_m': None,
+                       'ev_gate': 'ok',
                        'reloc_fails': 0, 'locals_recent': 0, 'recover_n': 0,
                        'cov_gated_run': 0, 'vio_jumps': 0}
 
@@ -855,6 +891,11 @@ class MclNode(Node):
                                         #  vio_R) last MEASUREMENT fix, anchored
                                         #  at its CAPTURE time for EV propagation
         self.ev_pose_t = -1.0           # stamp of the last mcl.step
+        self.ev_last_pos = None         # last DELIVERED finite EV pose (t,x,y)
+        self.ev_jump_ok = 0             # rescan-confirm jump allowance left
+        self.ev_tele = False            # teleport gate currently tripped
+        self.dr_gate_ok = True          # rescan DR plausibility gate enabled
+        self.dr_blocks = 0              # consecutive fully-blocked rescans
 
         self.create_subscription(Image, str(param('frame_topic',
                                                   '/cam0/image_raw')),
@@ -999,6 +1040,7 @@ class MclNode(Node):
                     and self.lost_count == 0
                     and t - self.ev_pose_t <= EV_POSE_PROP_S)
         pc = out.pose.covariance
+        tele = False
         if tracking:
             ft, fx, fy, yaw, spread, neff, fp, fR = self.ev_fix
             x, y = fx, fy
@@ -1019,6 +1061,33 @@ class MclNode(Node):
                     c, s = math.cos(yaw), math.sin(yaw)
                     x = fx + dx * c - dy * s
                     y = fy + dx * s + dy * c
+            # --- teleport gate (false-lock fix, 2026-09-22) -----------------
+            # A delivered fix sequence must be physically consistent: an
+            # implied speed beyond EV_JUMP_MPS with no rescan-confirm
+            # marker (ev_jump_ok) means the filter got yanked by an
+            # aliasing false update — NaN the pose until a confirmed
+            # reseed re-links it. The guard treats health
+            # ev_gate='teleport' as degraded.
+            if self.ev_last_pos is not None and self.ev_jump_ok <= 0:
+                lt, lx, ly = self.ev_last_pos
+                if math.hypot(x - lx, y - ly) > EV_JUMP_MPS * max(
+                        1e-3, t - lt) + EV_JUMP_M:
+                    tele = True
+                    self.health['ev_gate'] = 'teleport'
+                    if not self.ev_tele:
+                        self.ev_tele = True
+                        self.get_logger().warn(
+                            'EV teleport gate: %.0f m jump in %.2f s with '
+                            'no rescan marker — pose NaN until re-linked'
+                            % (math.hypot(x - lx, y - ly), t - lt))
+        if tracking and not tele:
+            self.health['ev_gate'] = 'ok'
+            self.ev_last_pos = (t, x, y)
+            self.ev_jump_ok = 0
+            if self.ev_tele:
+                self.ev_tele = False
+                self.get_logger().info(
+                    'EV teleport gate re-linked at (%.1f, %.1f) m' % (x, y))
             out.pose.pose.position.x = float(x)   # ENU map frame: x east,
             out.pose.pose.position.y = float(y)   # y north of the map center
             out.pose.pose.position.z = 0.0        # z not fused (baro owns it)
@@ -1064,28 +1133,29 @@ class MclNode(Node):
         self.imu_last_t = t
 
     def ensure_fcu(self):
-        """Lazily parse the FCU baro height + EKF attitude/heading from the
-        ULog beside the bag (replay). Returns (alt_at, tilt_at, hdg_at);
-        any may be None (then VIO is the fallback / no steering). Independent
-        of SchurVINS — keeps the orthoprojection geometry sane if the VIO
-        diverges."""
+        """Lazily parse the FCU baro height + EKF attitude/heading/velocity
+        from the ULog beside the bag (replay). Returns
+        (alt_at, tilt_at, hdg_at, vel_at); any may be None (then VIO is the
+        fallback / no steering / no DR reference). Independent of SchurVINS
+        — keeps the orthoprojection geometry sane if the VIO diverges."""
         if self.fcu_tried:
-            return self.fcu_alt, self.fcu_tilt, self.fcu_hdg
+            return self.fcu_alt, self.fcu_tilt, self.fcu_hdg, self.fcu_vel
         self.fcu_tried = True
         if not self.bag_dir:
-            return None, None, None
+            return None, None, None, None
         try:
-            alt_at, tilt_at, hdg_at = bag_fcu_streams(self.bag_dir,
-                                                      self.R_fcu2cam)
+            alt_at, tilt_at, hdg_at, vel_at = bag_fcu_streams(
+                self.bag_dir, self.R_fcu2cam)
         except Exception as e:       # parsing/alignment failed
             self.get_logger().warn(f'FCU streams unavailable: {e}')
-            alt_at = tilt_at = hdg_at = None
-        self.fcu_alt, self.fcu_tilt, self.fcu_hdg = alt_at, tilt_at, hdg_at
+            alt_at = tilt_at = hdg_at = vel_at = None
+        (self.fcu_alt, self.fcu_tilt, self.fcu_hdg,
+         self.fcu_vel) = alt_at, tilt_at, hdg_at, vel_at
         if alt_at is not None or tilt_at is not None:
             self.get_logger().info(
                 'FCU baro altitude + EKF attitude active (ULog, '
                 'orthoprojection decoupled from VIO)')
-        return alt_at, tilt_at, hdg_at
+        return alt_at, tilt_at, hdg_at, vel_at
 
     # ------------------------------------------- FCU altitude + attitude
     def on_fcu_alt(self, msg):
@@ -1099,6 +1169,8 @@ class MclNode(Node):
         with self.buf_lock:          # live_fcu_* readers run in process_one
             self.fcu_alt_t.append(t)
             self.fcu_alt_z.append(float(msg.pose.position.z))
+            self.fcu_px.append(float(msg.pose.position.x))
+            self.fcu_py.append(float(msg.pose.position.y))
             q = msg.pose.orientation
             n2 = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w
             if n2 > 0.25:                # orientation filled (not all-zero)
@@ -1229,6 +1301,44 @@ class MclNode(Node):
             return hdg_at(t) if hdg_at is not None else None
         return self.live_fcu_hdg(t)
 
+    def live_fcu_vel(self, t):
+        """(v_east, v_north) m/s at time t from the live MAVROS ENU position
+        deque, or None: finite difference between the sample nearest t
+        (within 0.5 s — no silent clamping) and the oldest sample 0.8-2.5 s
+        before it. The MAVROS ENU frame IS the MCL map frame (x = East,
+        y = North), so no rotation is needed; the >= 0.8 s baseline rides
+        over the single-sample jitter. No fresh-sample fallback (the DR
+        gate must not extrapolate from stale velocity)."""
+        with self.buf_lock:         # on_fcu_alt appends on its own thread
+            if len(self.fcu_alt_t) < 2:
+                return None
+            ts = list(self.fcu_alt_t)
+            xs = list(self.fcu_px)
+            ys = list(self.fcu_py)
+            import bisect
+            i = bisect.bisect_left(ts, t)
+            lo, hi = max(0, i - 1), min(len(ts) - 1, i)
+            if abs(ts[lo] - t) <= abs(ts[hi] - t):
+                hi = lo
+            if abs(ts[hi] - t) > 0.5:
+                return None
+            j = hi
+            while j > 0 and ts[hi] - ts[j - 1] < 0.8:
+                j -= 1
+            dt = ts[hi] - ts[j]
+            if dt < 0.8 or dt > 2.5:
+                return None
+            return ((xs[hi] - xs[j]) / dt, (ys[hi] - ys[j]) / dt)
+
+    def fcu_vel_at(self, t):
+        """FCU EKF horizontal velocity (v_east, v_north) m/s at time t —
+        replay/live abstraction like fcu_tilt_at. None -> no DR reference
+        (the rescan gate is skipped)."""
+        if self.bag_dir:
+            vel_at = self.ensure_fcu()[3]
+            return vel_at(t) if vel_at is not None else None
+        return self.live_fcu_vel(t)
+
     def yaw_pred_at(self, t):
         """Compass-predicted MCL map yaw of the camera optical x-axis, or
         None when no heading is available: yaw = a*hdg + radians(b)."""
@@ -1236,6 +1346,87 @@ class MclNode(Node):
         if hdg is None:
             return None
         return self.yaw_a * hdg + math.radians(self.yaw_b)
+
+    # ------------------------------------------------- DR plausibility gate
+    def dr_displacement(self, t0, t1):
+        """FCU-velocity dead-reckoned MAP displacement [m] from t0 to t1, or
+        None.
+
+        Physical-plausibility reference that stays honest while VIO is
+        dead (bag 190020: SchurVINS diverged for 165 s, z to -11 km).
+        Single-integrates the flight-controller EKF horizontal velocity —
+        vibration-filtered on the FCU side (the raw /imu0 accelerometer is
+        NOT usable on this airframe: |a-g| p50 7.4 m/s^2 aliases into
+        low-frequency garbage at 200 Hz, which made the previous accel
+        double-integration diverge by 200-880 m over 10-14 s windows).
+        The MCL map frame is ENU, so east/north velocity IS map x/y
+        velocity. None when the velocity stream does not cover [t0, t1]
+        (no silent clamping)."""
+        ts = np.linspace(t0, t1, max(2, int((t1 - t0) / 0.1) + 1))
+        vE = np.empty(len(ts))
+        vN = np.empty(len(ts))
+        for i, x in enumerate(ts):
+            v = self.fcu_vel_at(x)
+            if v is None:
+                return None
+            vE[i], vN[i] = v
+        d = np.diff(ts)
+        return (float(np.sum((vE[:-1] + vE[1:]) * 0.5 * d)),
+                float(np.sum((vN[:-1] + vN[1:]) * 0.5 * d)))
+
+    def dr_filter_peaks(self, peaks, t):
+        """Prune rescan nominees that are physically impossible, or [].
+
+        A CONFIRMED false lock is invisible to score-based confirmation
+        (bag 190020: the first rescan during the VIO-death window
+        confirmed at a 205 m-off lookalike and fed EKF2 wrong fixes for
+        25 s) — but the drone cannot have flown there: each nominee must
+        lie within the FCU-velocity dead-reckoned region around
+        last_good, with a tolerance that grows with the lost window as
+        DR drift accumulates. [] blocks the reseed this cycle; after
+        DR_GATE_MAX_BLOCKS fully-blocked rescans the reference itself
+        is suspect and the gate disables itself (a broken DR stream
+        must not wedge the recovery machinery).
+        """
+        if not peaks or not self.dr_gate_ok:
+            return peaks
+        lg = self.last_good
+        if lg is None:
+            return peaks               # init/scan-lock: no reference yet
+        dt_l = t - lg[3]
+        if dt_l <= 0.0 or dt_l > DR_GATE_MAX_S:
+            return peaks
+        dd = self.dr_displacement(lg[3], t)
+        if dd is None:
+            return peaks                # no DR reference available
+        tol = min(DR_TOL[0] + DR_TOL[1] * dt_l + DR_TOL[2] * dt_l * dt_l,
+                  DR_TOL_MAX)
+        cx, cy = lg[0] + dd[0], lg[1] + dd[1]
+        kept = [pk for pk in peaks
+               if math.hypot(pk[1] - cx, pk[2] - cy) <= tol]
+        if len(kept) == len(peaks):
+            self.dr_blocks = 0
+            return peaks
+        if kept:
+            self.dr_blocks = 0
+            self.get_logger().warn(
+                't=%.1f DR gate: pruned %d/%d rescan nominees outside '
+                '%.0f m of last_good + DR (%+.0f,%+.0f) m'
+                % (t, len(peaks) - len(kept), len(peaks), tol,
+                   dd[0], dd[1]))
+            return kept
+        self.dr_blocks += 1
+        self.get_logger().warn(
+            't=%.1f DR gate: BLOCKED reseed — all %d nominees outside '
+            '%.0f m of last_good + DR (%+.0f,%+.0f) m [%d/%d]'
+            % (t, len(peaks), tol, dd[0], dd[1], self.dr_blocks,
+               DR_GATE_MAX_BLOCKS))
+        if self.dr_blocks >= DR_GATE_MAX_BLOCKS:
+            self.dr_gate_ok = False
+            self.get_logger().warn('DR gate disabled: repeated full blocks '
+                                   'suggest the DR reference itself is off')
+            return peaks
+        return []
 
     def on_image(self, msg):
         if msg.encoding != 'mono8':
@@ -1880,6 +2071,9 @@ class MclNode(Node):
                         self.reloc_fails = 0
                         self.global_pending_since = None
                         self.last_good = (est['x'], est['y'], est['yaw'], t, psi)
+                        # the confirmed reseed MAY jump the delivered EV
+                        # stream once (it passed the DR plausibility gate)
+                        self.ev_jump_ok = 2
                         self.get_logger().info(
                             f'k={k}: recovery CONFIRMED at '
                             f"({est['x']:.0f},{est['y']:.0f}) m — tracking")
@@ -2009,11 +2203,14 @@ class MclNode(Node):
                         std = (48.0, 48.0, 0.30, 0.03)
                     self.reloc_fails = 0
                     self.log[-1]['reloc'] = 2
-                self.particles = particles_from_peaks(
-                    self.mcl, peaks, self.n_particles, std=std)
-                self.recovering = True
-                self.recover_count = 0
-                self.reseed_t = t
+                # --- rescan-nominee plausibility gate (false-lock fix) -----
+                peaks = self.dr_filter_peaks(peaks, t)
+                if peaks:
+                    self.particles = particles_from_peaks(
+                        self.mcl, peaks, self.n_particles, std=std)
+                    self.recovering = True
+                    self.recover_count = 0
+                    self.reseed_t = t
                 self.lost_count = 0
 
     # ---------------------------------------------------------------- debug

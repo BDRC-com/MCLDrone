@@ -121,6 +121,11 @@ class Guard:
             # (diverged SchurVINS, z to -11 km observed on bag 190020).
             # 'drop' is kept for back-compat with the original step-5 tests.
             cond, grace = 'vio_drop', self.vio_grace_s
+        elif health.get('ev_gate') == 'teleport':
+            # mcl_node's EV teleport gate tripped: the delivered fix stream
+            # jumped without a rescan-confirm marker (false-lock fix,
+            # 2026-09-22) — the fused pose is untrustworthy
+            cond, grace = 'ev_teleport', self.vio_grace_s
         else:
             st = str(health.get('state', 'no_frames'))
             if st != 'tracking':
