@@ -41,8 +41,8 @@ unset ZSH_VERSION ZSH_NAME BASH_ENV AMENT_CURRENT_PREFIX 2>/dev/null || true
 # ----------------------------- configurable defaults ------------------------
 NAME="live_$(date +%Y%m%d_%H%M%S)"
 DOMAIN=0
-BAG_ROOT="$HOME/bags"             # ros2 bag output root
-MCL_ROOT="$HOME/mcl_runs"         # MCL replay_log.npz / plots root
+BAG_ROOT="$HOME/ros2bag                   # ros2 bag output root
+MCL_ROOT="$HOME/ros2bag/mcl_runs"         # MCL replay_log.npz / plots root
 MAP_PATH="$HOME/MCLDrone/maps/z17_5120.png"
 OFF_X="-27449088.0"
 OFF_Y="-14586624.0"
