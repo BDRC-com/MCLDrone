@@ -552,9 +552,11 @@ export ROS_DOMAIN_ID=0
 source /opt/ros/humble/setup.zsh
 source ~/MCLDrone/ovws/install/setup.zsh
 source ~/my_px4/install/setup.zsh
-# 后台启动摄像机
-nohup ~/start_camera.sh > /tmp/camera_bridge.log 2>&1 & disown
+NAME=flight01 # 你可以选择任何你想要的名字
+mkdir -p ~/ros2bag/mcl_runs ~/ros2bag/${NAME}_flightlog
+nohup ~/start_camera.sh > ~/ros2bag/${NAME}_flightlog/camera_bridge.log 2>&1 & disown
 ros2 topic hz /imu0 # 检查IMU话题频率
+tail -f ~/ros2bag/${NAME}_flightlog/camera_bridge.log
 ```
 
 ## 2. 启动MCLDrone
@@ -592,7 +594,7 @@ ros2 topic hz /imu0 # 检查IMU话题频率
 ```bash
 ~/MCLDrone/run_live.sh --name flight01 --status
 # Or
-tail -f /tmp/run_live_flight01.console.log
+tail -f ~/ros2bag/flight01_flightlog/console.log
 ```
 
 #### 2-1-3. 结束录制
@@ -704,7 +706,7 @@ nohup python3 ~/MCLDrone/mission_manager.py --ros-args \
 disown
 
 #监控与停止：
-tail -f ~/flight_logs/manager.log
+tail -f ~/ros2bag/${NAME}_flightlog/manager.log
 ROS_DOMAIN_ID=0 ros2 topic echo /mission/state
 pkill -INT -f mission_manager.py     # 先停它，再停 MCL/recorder
 ```
@@ -738,11 +740,12 @@ ls -la ~/ros2bag/mcl_runs/${NAME}/
 
 ```bash
 # 杀掉所有进程
-pkill -f MicroXRCEAgent
-pkill -f fcu_pose_bridge.py
-pkill -f 'ros2 bag record'
-pkill -f '/lib/ov_mcl/mcl_node'
+pkill -INT -f '/lib/ov_mcl/mcl_node'
+pkill -INT -f 'ros2 launch ov_mcl'
+pkill -INT -f 'ros2 bag record'
 pkill -f run_subscribe_msckf
+pkill -INT -f fcu_pose_bridge.py
+pkill -INT -f MicroXRCEAgent
 ss -ulnp | grep 8888 # 需要为空
 ```
 
@@ -754,7 +757,7 @@ ss -ulnp | grep 8888 # 需要为空
 | ----------------- | ------------ | -------------------------------------------------------- |
 | `--name <s>`      | `live_<时间戳>` | 运行名；bag、MCL 输出、PID、日志均按它命名                               |
 | `--domain <n>`    | `0`          | `ROS_DOMAIN_ID`；FCU、相机、recorder 必须同域                     |
-| `--daemon` / `-D` | 关            | 新会话脱离 SSH（断连继续运行）；日志到 `/tmp/run_live_<name>.console.log` |
+| `--daemon` / `-D` | 关            | 新会话脱离 SSH（断连继续运行）；日志到 `$BAG_ROOT/<name>_flightlog/console.log` |
 | `--stop`          | —            | 停止同名运行（manager→MCL npz→recorder→其它）                      |
 | `--status`        | —            | 查看进程与日志尾部                                                |
 | `-h` / `--help`   | —            | 帮助                                                       |
@@ -848,9 +851,9 @@ QGC `.plan` 支持的指令：`NAV_TAKEOFF`（取 home/local origin）、
 | 图像 bag | `$BAG_ROOT/<name>_img/`                                               |
 | 数据 bag | `$BAG_ROOT/<name>_data/`                                              |
 | MCL 结果 | `$MCL_ROOT/<name>/`（replay\_log.npz、replay.png）                       |
-| 各组件日志  | `/tmp/run_live_<name>/{agent,bridge,record_*,mcl_launch,manager}.log` |
-| 守护态控制台 | `/tmp/run_live_<name>.console.log`                                    |
-| PID    | `/tmp/run_live_<name>.pid`                                            |
+| 各组件日志  | `$BAG_ROOT/<name>_flightlog/{agent,bridge,record_*,mcl_launch,manager}.log` |
+| 守护态控制台 | `$BAG_ROOT/<name>_flightlog/console.log`                                    |
+| PID    | `$BAG_ROOT/<name>_flightlog/run.pid`                                            |
 
 ## 停止顺序（`--stop` 内部逻辑）
 

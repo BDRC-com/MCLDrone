@@ -16,8 +16,9 @@
 #      and you fly from QGC.)
 #
 # --daemon / -D: detach the WHOLE stack (new session) so an SSH disconnect
-#                 cannot stop it in flight; console -> /tmp/run_live_<name>.
-#                 console.log. Control with --status and --stop (same --name).
+#                 cannot stop it in flight; console ->
+#                 $BAG_ROOT/<name>_flightlog/console.log.
+#                 Control with --status and --stop (same --name).
 #
 # Ctrl-C once -> SIGINT the launch (MCL flushes replay_log.npz) -> stops the
 # recorder cleanly -> kills SchurVINS/bridge/agent that survive launch exit.
@@ -159,8 +160,11 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-PID_FILE="/tmp/run_live_${NAME}.pid"
-CONSOLE_LOG="/tmp/run_live_${NAME}.console.log"
+# All per-flight logs live with the bags (persistent; /tmp is cleared on
+# reboot): $BAG_ROOT/<name>_flightlog/{console.log,*.log,roslog/}.
+LOG_DIR="$BAG_ROOT/${NAME}_flightlog"
+PID_FILE="$LOG_DIR/run.pid"
+CONSOLE_LOG="$LOG_DIR/console.log"
 
 # ----------------------------- control commands -----------------------------
 if [ "$DO_STATUS" = 1 ]; then
@@ -226,15 +230,15 @@ for f in "$ROS_SETUP" "$PX4_SETUP" "$MCL_SETUP"; do
   source "$f"
 done
 export ROS_DOMAIN_ID="$DOMAIN"
-export ROS_LOG_DIR=/tmp/roslog
-mkdir -p "$BAG_ROOT" "$MCL_ROOT"
+mkdir -p "$BAG_ROOT" "$MCL_ROOT" "$LOG_DIR"
+export ROS_LOG_DIR="$LOG_DIR/roslog"
 
 OUT_DIR="$MCL_ROOT/$NAME"
 BAG_IMG_DIR="$BAG_ROOT/${NAME}_img"
 BAG_DATA_DIR="$BAG_ROOT/${NAME}_data"
 BAG_DIR="$BAG_ROOT/${NAME}_bag"       # single-recorder mode (--topics)
-LOG_DIR="/tmp/run_live_$NAME"
-mkdir -p "$OUT_DIR" "$LOG_DIR"
+# LOG_DIR = $BAG_ROOT/<name>_flightlog, created in the environment section.
+mkdir -p "$OUT_DIR"
 
 AGENT_PID=""; REC_PIDS=""; BRIDGE_PID=""; LAUNCH_PID=""; MGR_PID=""
 CLEANED=0
