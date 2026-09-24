@@ -1,5 +1,4 @@
-# 在ROS2 Bag中运行MCLDrone
-## 1. 配置环境
+# 配置环境
 ```bash
 git clone https://github.com/Mastopke304/MCLDrone.git
 cd MCLDrone
@@ -35,8 +34,8 @@ git clone https://github.com/BDRC-com/ov_SchurVINS.git
 cd ~/MCLDrone/ovws/
 colcon build
 ```
-
-## 2. 运行ov_SchurVINS + MCL -> Odometry
+# 在ROS2 Bag中运行MCLDrone
+## 1. 运行ov_SchurVINS + MCL -> Odometry
 ```bash
 cd ~/MCLDrone
 log_out_dir=./test/mcl_replay_190020_log
@@ -60,7 +59,7 @@ ros2 bag record /mcl/odom /mcl/health /ov_msckf/odomimu -o $bag_out_dir
 rviz2 -d ~/MCLDrone/ovws/src/ov_SchurVINS/ov_msckf/launch/display_ros2.rviz
 ```
 
-## 3. 可视化Odometry和GPS Truth
+## 2. 可视化Odometry和GPS Truth
 ```bash
 python3 ~/MCLDrone/plot_odom_vs_gps.py \
     $log_out_dir \  # MCL run directory
