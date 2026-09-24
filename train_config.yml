@@ -1,94 +1,70 @@
-# Configuration for train_similarity.py (mirrors sivl/configs/configuration.yml).
-#
-# To train for a NEW region, edit the "region data" entries below:
-#   1. trainingdata_bitmaps / testingdata_bitmaps -> multi-temporal area
-#      folders: each folder holds aligned, equally-sized, different-time
-#      images (year_month_N.jpg Google-Earth exports of one fixed viewport).
-#      Anchor/positive pairs are drawn from DIFFERENT temporal layers of
-#      the same location (forces time-invariant structural features, like
-#      sivl's BitmapDataset). Held-out testing areas must be spatially
-#      disjoint from the training areas. Like origin sivl, the bank grids
-#      at the images' NATIVE pixel size (no GSD resampling).
-#   2. map -> your deployment MCL map, its m/px, and geo_offset
-#      (local map px = global z17 web-mercator px + geo_offset; for a map
-#      stitched from z17 tiles with top-left tile origin (tx,ty):
-#      geo_offset = [-tx*256, -ty*256])
-#   3. flights -> your recorded flights (may be [] to skip real pairs)
-#   4. experiment names / checkpoint paths
-# then run:  --build-bank -> pretrain -> --build-real -> --finetune
-
-device: "cuda:0" # CUDA device to use.
+device: "cuda:0" # CUDA 设备.
 
 data:
   path:
-    # ---- region data (edit per region) ----
-    trainingdata_bitmaps: # multi-temporal area folders used in training
-      woodbridge: "/home/one/GNSS-denied-Localization/datasets/woodbridge"
-      fountainhead: "/home/one/GNSS-denied-Localization/datasets/fountainhead"
-      area_1: "/home/one/GNSS-denied-Localization/datasets/huizhou/area_1" # flight/deployment area
-      area_2: "/home/one/GNSS-denied-Localization/datasets/huizhou/area_2"
-      area_4: "/home/one/GNSS-denied-Localization/datasets/huizhou/area_4"
-      area_5: "/home/one/GNSS-denied-Localization/datasets/huizhou/area_5"
-      area_6: "/home/one/GNSS-denied-Localization/datasets/huizhou/area_6"
-      area_8: "/home/one/GNSS-denied-Localization/datasets/huizhou/area_8"
-      area_9: "/home/one/GNSS-denied-Localization/datasets/huizhou/area_9"
-      area_10: "/home/one/GNSS-denied-Localization/datasets/huizhou/area_10"
-      area_11: "/home/one/GNSS-denied-Localization/datasets/huizhou/area_11"
-      area_12: "/home/one/GNSS-denied-Localization/datasets/huizhou/area_12"
-      area_13: "/home/one/GNSS-denied-Localization/datasets/huizhou/area_13"
-      area_14: "/home/one/GNSS-denied-Localization/datasets/huizhou/area_14"
-      area_15: "/home/one/GNSS-denied-Localization/datasets/huizhou/area_15"
-    testingdata_bitmaps: # held-out areas (simval during pretrain and finetune)
-      area_3: "/home/one/GNSS-denied-Localization/datasets/huizhou/area_3"
-      area_7: "/home/one/GNSS-denied-Localization/datasets/huizhou/area_7"
-    patch_bank: "/home/one/GNSS-denied-Localization/huizhou_map/patch_bank" # --build-bank / --build-real output
+    # ---- 地区数据 ----
+    # 根据你的数据目录实际来修改
+    trainingdata_bitmaps: # 训练集
+      woodbridge: "./data/woodbridge"
+      fountainhead: "./data/fountainhead"
+      area_1: "./data/area_1"
+      area_2: "./data/area_2"
+      area_4: "./data/area_4"
+      area_5: "./data/area_5"
+      area_6: "./data/area_6"
+      area_8: "./data/area_8"
+      area_9: "./data/area_9"
+      area_10: "./data/area_10"
+      area_11: "./data/area_11"
+      area_12: "./data/area_12"
+      area_13: "./data/area_13"
+      area_14: "./data/area_14"
+      area_15: "./data/area_15"
+    testingdata_bitmaps: # 验证集
+      area_3: "./data/area_3"
+      area_7: "./data/area_7"
+    patch_bank: "./data/patch_bank" # 地图区块库保存位置
 
-    map: # deployment MCL map (real pairs and their negatives are cropped from it)
-      path: "/home/one/GNSS-denied-Localization/z17_5120.png"
-      gsd: 1.10 # m/pixel of the deployment map (z17 at lat 22.8 = 1.10; a wrong
-             # value scales all real-pair positives — verify before --build-real!)
-      geo_offset: [-27449088.0, -14586625.0]
+    map: # 用作大地图的地图文件（这里使用已经拼接好的地图，后续可以使用MapDB动态拼接）
+      path: "./z17_5120.png"
+      gsd: 1.10 # 大地图的分辨率（米/像素），会影响缩放，一定要提前计算好！
+      geo_offset: [-27449088.0, -14586625.0] # 经纬度
 
-    flights: # recorded flights for real-pair building (--build-real)
+    flights: # 自己录制的飞行数据包，用作后续的finetuning，需要包（.db3）与飞行日志（.ulg）
       - name: "bag_0001_20260831_184004"
-        run_dir: "/home/one/GNSS-denied-Localization/sample_images/mcl_test/bag0001_debug" # replay_log.npz + debug/k*_4_patch.png (MCL run with save_debug)
-        ulog: "/home/one/workspace/datasets/bag_0001_20260831_184004/08_13_15.ulg" # flight log with GPS truth
-        db3: "/home/one/workspace/datasets/bag_0001_20260831_184004/bag_0001_20260831_184004_0.db3" # rosbag db3 (IMU, for clock alignment)
-        alt_min_m: 30.0 # skip takeoff/landing frames below this altitude (cruise ~125 m)
+        run_dir: "./sample_images/mcl_test/bag_0001_20260831_184004_debug"
+        ulog: "/your/path/to/bag/bag_0001_20260831_184004/08_13_15.ulg" # 飞行日志用于提供GPS路径真值
+        db3: "/home/one/workspace/datasets/bag_0001_20260831_184004/bag_0001_20260831_184004_0.db3" # rosbag db3 (摄像头图像+IMU，用于时间戳对齐)
+        alt_min_m: 30.0 # 设置为多少就从多少米的高度开始运行MCL（巡航高度在120米左右）
       - name: "bag_0001_20260908_174711"
-        run_dir: "/home/one/GNSS-denied-Localization/sample_images/mcl_test/bag174711_debug"
-        ulog: "/home/one/workspace/datasets/bag_0001_20260908_174711/log_18_2026-9-8-17-54-50.ulg"
-        db3: "/home/one/workspace/datasets/bag_0001_20260908_174711/bag_0001_20260908_174711_0.db3"
-        alt_min_m: 30.0 # cruise up to ~132 m; TRAINING flight (not in val_flights)
-      # 190020 (19:00 near-sunset flight, same area): built into real_pairs but
-      # HELD OUT from fine-tuning — it is the cross-flight validation flight
-      # (see finetune.val_flights below). The debug run_dir must have
-      # save_debug patches + replay_log (its tracking quality is irrelevant:
-      # drone patches use only that frame's tilt/altitude, and truth comes
-      # from the ulog GPS at each frame's own timestamp).
+        run_dir: "./sample_images/mcl_test/bag_0001_20260831_184004_debug"
+        ulog: "/your/path/to/bag/datasets/bag_0001_20260908_174711/log_18_2026-9-8-17-54-50.ulg"
+        db3: "/your/path/to/bag/bag_0001_20260908_174711/bag_0001_20260908_174711_0.db3"
+        alt_min_m: 30.0
       - name: "bag_0001_20260831_190020"
-        run_dir: "/home/one/GNSS-denied-Localization/sample_images/mcl_test/bag0001_190020_debug"
-        ulog: "/home/one/workspace/datasets/bag_0001_20260831_190020/08_32_59.ulg"
-        db3: "/home/one/workspace/datasets/bag_0001_20260831_190020/bag_0001_20260831_190020_0.db3"
-        alt_min_m: 30.0 # cruise ~130 m
+        run_dir: "./sample_images/mcl_test/bag_0001_20260831_190020_debug"
+        ulog: "/your/path/to/bag/bag_0001_20260831_190020/08_32_59.ulg"
+        db3: "/your/path/to/bag/bag_0001_20260831_190020/bag_0001_20260831_190020_0.db3"
+        alt_min_m: 30.0
+  
+  # 用于标志相机图像和GPS真值下的大地图图像的模型，一定要是可靠的模型，可以使用预训练好的模型
+    label_model_checkpoint: "./checkpoints/your_model.pt" 
 
-    # Model that rotation-labels real pairs: must score TRUE pairs reliably
-    # high. The original sivl Sweden checkpoint generalizes across regions;
-    # alternatively use your region's pretrain checkpoint.
-    label_model_checkpoint: "/home/one/GNSS-denied-Localization/sivl/checkpoints/training_4_epoch_00200_of_200.pt"
-
-training: # pretrain on multi-temporal bank pairs (different-time same-location)
-  checkpoint_saving_path: "/home/one/GNSS-denied-Localization/checkpoints_huizhou/"
-  initial_model_checkpoint: "/home/one/GNSS-denied-Localization/checkpoints_huizhou/huizhou_mt_1_epoch_300_of_1000.pt"
-  use_only_network_params: False
-  numEpochs: 1000
-  save_every: 100
-  batchsize: 800
-  lr: 0.00001
-  num_workers: 6
-  experiment_name: "huizhou_mt_1"
-  # --- sivl BitmapDataset sampling parameters (see sivl/datasourcing/
-  #     BitmapDataset.py and TemporalBankDataset in train_similarity.py) ---
+training: # 预训练
+  checkpoint_saving_path: "./checkpoints/" # 模型权重保存路径
+  initial_model_checkpoint: "./checkpoints/your_initial_model.pt" # 起始模型权重，用于断点重联，如果找不到则会从头开始训练
+  use_only_network_params: False # False，加载模型权重加上loss和epoch的历史，用于断点重联；
+                   # True，只加载模型权重。
+  numEpochs: 1000 # 最高训练多少个epoch
+  save_every: 100 # 每训练多少个epoch就保存一次权重
+  batchsize: 800 # 批次大小，越大训练速度越快但需要越大的显存
+  lr: 0.00001 # 学习率，决定学习的速度，非必要不动
+  num_workers: 6 # 线程数，并非越高越好，非必要不动
+  experiment_name: "train_1" # 此次训练的名字，所有权重都会被保存为 {experiment_name}_epoch_{现在的epoch}_of_{numEpochs}.pt
+  
+  # 如果之前训练到Epoch 300后中断了，权重保存为了 train_1_epoch_300_of_1000.pt，将这个中断的权重设置为起始权重后 (initial_model_checkpoint=train_1_epoch_300_of_1000.pt)，且use_only_network_params=False，这会加载loss和epoch的历史，因此训练会从300/1000处开始。如果use_only_network_params=True，则之加载权重，训练会从0/1000开始，因此加上之前已经训练好的300个epoch，总共会有1300个epoch。
+  
+  # 地图区块库的构建参数（非必要不动）
   marginBetweenSamples_px: 0 # grid step = 96 + this (0 = adjacent samples, no stride)
   apShiftingStd: 20 # centerpoint jitter, drawn once per node at --build-bank
   rotationErrorStd_deg: 0.5 # positive-pair rotation noise
@@ -100,15 +76,16 @@ training: # pretrain on multi-temporal bank pairs (different-time same-location)
   nearNegativeMax_px: 600 #  false-peak distances)
   negativeMixture: {near: 0.3, far: 0.5, rotated: 0.2}
 
-finetune: # mixed real + simulated training after pretrain (--finetune)
-  checkpoint_saving_path: "/home/one/GNSS-denied-Localization/checkpoints_huizhou/"
-  initial_model_checkpoint: "/home/one/GNSS-denied-Localization/checkpoints_huizhou/huizhou_mt_1_epoch_1000_of_1000.pt" # pretrain output (after the sivl resume, saves land at epochs 300..1000; pick any)
+finetune: # finetuning，使用真实录制的包，在预训练结束后做
+  checkpoint_saving_path: "./checkpoints/"
+  initial_model_checkpoint: "./checkpoints/model_pretrained.pt" # 预训练结束后得到的最终权重
   use_only_network_params: True
   numEpochs: 40
   save_every: 10
   batchsize: 800
   lr: 0.00001
   num_workers: 6
+  # 下面参数非必要不动
   p_real: 0.3 # fraction of real-pair items per batch
   rotationErrorStd_deg: 3.0 # real-pair positive rotation jitter
   positiveScaleMin: 0.75 # real-pair positive scale jitter (covers coverage
@@ -119,11 +96,13 @@ finetune: # mixed real + simulated training after pretrain (--finetune)
   # while a different flight false-locked (2026-09-09: ft trained on 184004
   # scored truth 1.000 on 184004 but 0.003 on held-out 190020). Empty list =
   # legacy every-5th-frame in-flight split.
+  
+  # 作为验证集的包
   val_flights: ["bag_0001_20260831_190020"]
-  experiment_name: "huizhou_ft_mt_1"
+  experiment_name: "train_ft_1"
 
 evaluation:
-  model_checkpoint: "/home/one/GNSS-denied-Localization/checkpoints_huizhou/huizhou_ft_mt_1_epoch_040_of_40.pt"
+  model_checkpoint: "./checkpoints/train_ft_1_epoch_040_of_40.pt" # finetuning结束之后用于验证的权重
 
 sampledimensions:
-  dimension_px: 96 # network input size (sivl sampledimensions)
+  dimension_px: 96 # 模型输入大小，同时也是地图区块库的构建大小，非必要不动
