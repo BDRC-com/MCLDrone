@@ -567,6 +567,9 @@ ros2 topic hz /imu0 # 检查IMU话题频率
 ### 2-1. 启动MCLDrone（脚本）
 
 #### 2-1-1. 使用脚本启动MCLDrone
+选择其中一个：
+ - 仅观察MCLDrone的Odometry
+ - 将MCLDrone的Odometry推送给EV，在QGC中设定好计划，保存为`*.plan`
 
 仅观察MCLDrone的Odometry：
 
@@ -606,7 +609,7 @@ pkill -INT -f 'ros2 launch cyperstereo_ros2_bridge' # 关闭进程
 pgrep -af 'cyperstereo|capture_image|mjpeg' # 检查进程是否已关闭（应该为空）
 ```
 
-### 2-2. 启动MCLDrone（手动启动）
+### 2-2. 启动MCLDrone（手动分别启动）
 
 #### 2-2-1. 启动MicroXRCE-DDS agent
 
@@ -661,6 +664,10 @@ tail -f ~/ros2bag/${NAME}_flightlog/rec_data.log ## 检查，可选
 
 #### 2-2-4. 启动VIO + MCL -> Odometry
 
+选择其中一个：
+ - 仅观察MCLDrone的Odometry
+ - 将MCLDrone的Odometry推送给EV，在QGC中设定好计划，保存为`*.plan`
+
 仅观察MCLDrone的Odometry：
 
 ```bash
@@ -687,13 +694,19 @@ ros2 topic hz /mcl/odom
 ```bash
 nohup python3 ~/MCLDrone/mission_manager.py --ros-args \
   -p mission_mode:=waypoints \
-  -p 'waypoints:=x,y; x,y' \
   -p ev_frame:=map \
-  -p local_origin_map_x:=<takeoff map ENU x> \
-  -p local_origin_map_y:=<takeoff map ENU y> \
-  -p cruise_alt:=50.0 \
-  > ~/flight_logs/manager.log 2>&1 &
+  -p map_geo_offset_x:=-27449088.0 -p map_geo_offset_y:=-14586624.0 \
+  -p map_zoom:=17 -p map_gsd:=1.1 -p map_center_px:=2560.0 \
+  -p map_center_lat:=22.8445297 -p map_center_lon:=114.5242310 \
+  -p cruise_alt:=120.0 -p v_max:=10.0 \
+  -p 'qgc_plan:=/home/ros2/missions/my_trace.plan' \
+  > ~/ros2bag/${NAME}_flightlog/manager.log 2>&1 &
 disown
+
+#监控与停止：
+tail -f ~/flight_logs/manager.log
+ROS_DOMAIN_ID=0 ros2 topic echo /mission/state
+pkill -INT -f mission_manager.py     # 先停它，再停 MCL/recorder
 ```
 
 #### 2-2-5. 结束录制（按顺序操作）
