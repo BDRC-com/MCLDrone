@@ -42,7 +42,7 @@ colcon build
 
 训练是 **x86\_64 开发机** 上的工作流，永远不在无人机上运行：无人机只加载训练产出的微调 checkpoint。
 
-## 本目录中的相关文件
+## 本目录中的训练相关文件
 
 | 文件                                            | 作用                                               |
 | --------------------------------------------- | ------------------------------------------------ |
@@ -52,7 +52,7 @@ colcon build
 | `sivl/models/orthosimilarity.py`              | BranchNet / DecisionNet 网络定义                     |
 | `sivl/utils/utils.py`                         | 地图切片 / tensor 辅助函数                               |
 | `bag_reader.py`、`mcl.py`、`orthoprojection.py` | 与运行时共用（真实航片对提取）                                  |
-| `environment_sivl.yml`                        | 可复现的 conda 环境（`sivl`，py3.9，torch 2.8 cu128）      |
+| `environment.yml`                        | 可复现的 conda 环境（`sivl`，py3.9，torch 2.8 cu128）      |
 
 数据和权重 **不进 git**：训练集、zarr patch bank、飞行 bag/ULog、`.pt` checkpoint 都需在开发机上另行准备，路径见 `train_config.yml`。
 
