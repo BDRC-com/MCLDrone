@@ -271,27 +271,76 @@ def latlon_to_map_px(lat, lon, off_x, off_y, z=17):
     return gx + off_x, gy + off_y
 
 
+def bag_imu_gyro_z(bag_dir):
+    """(t_sec, gyro_z) arrays for /imu0 from a flight/replay bag.
+
+    Supports both storage formats found in this project:
+      - sqlite3 *.db3 (old ros2 bag record output, parsed directly)
+      - mcap     *.mcap (Jazzy/Humble default; parsed via rosbag2_py)
+    Used to align the ULog boot clock to the companion/bridge clock by
+    gyro-z <-> yaw-rate correlation. Returns (None, None) if unavailable.
+    """
+    import glob
+    db3s = sorted(glob.glob(os.path.join(bag_dir, '*.db3')))
+    if db3s:
+        import sqlite3
+        from bag_reader import parse_imu
+        db = sqlite3.connect(f'file:{db3s[0]}?mode=ro', uri=True)
+        try:
+            tid = dict(db.execute('SELECT name,id FROM topics')).get('/imu0')
+            if tid is None:
+                return None, None
+            rows = db.execute(
+                'SELECT timestamp,data FROM messages WHERE topic_id=? '
+                'ORDER BY timestamp', (tid,)).fetchall()
+        finally:
+            db.close()
+        t_imu = np.array([parse_imu(b)[0] for _, b in rows])
+        gz = np.array([parse_imu(b)[1][2] for _, b in rows])
+        return t_imu, gz
+    mcaps = sorted(glob.glob(os.path.join(bag_dir, '*.mcap')))
+    if mcaps:
+        import rosbag2_py
+        from rclpy.serialization import deserialize_message
+        from rosidl_runtime_py.utilities import get_message
+        r = rosbag2_py.SequentialReader()
+        r.open(rosbag2_py.StorageOptions(uri=bag_dir, storage_id='mcap'),
+               rosbag2_py.ConverterOptions('', ''))
+        r.set_filter(rosbag2_py.StorageFilter(topics=['/imu0']))
+        cls = get_message('sensor_msgs/msg/Imu')
+        ts, gz = [], []
+        while r.has_next():
+            _topic, data, _ts = r.read_next()
+            m = deserialize_message(data, cls)
+            ts.append(m.header.stamp.sec + m.header.stamp.nanosec * 1e-9)
+            gz.append(m.angular_velocity.z)
+        if ts:
+            return np.asarray(ts), np.asarray(gz)
+    return None, None
+
+
 def bag_gps_truth(bag_dir, frame_t, off_x, off_y):
-    """GPS truth trace in map pixels for a replayed bag (PLOTTING ONLY —
-    never fed to the filter).
+    """GPS truth trace in map pixels for a replayed/flight bag (PLOTTING ONLY
+    — never fed to the filter).
 
     Reads the ULog recorded next to the bag (<bag_dir>/*.ulg) and aligns its
     boot clock to the bag/bridge clock by correlating the bag's /imu0 gyro-z
     with the ulog attitude yaw-rate (same method as train_similarity.py
     align_clocks; the PX4 time_utc_usec field is wrong on this rig — off by
-    ~21 h). Returns (px, py, off, corr): map-pixel coordinates of the GPS
-    track at the frame times in frame_t, the clock offset, and the peak
-    correlation. Returns None when the bag dir has no .ulg/.db3, no
-    /imu0, or the correlation is too weak (< 0.3) to trust the alignment.
+    ~21 h). /imu0 may live in a sqlite3 *.db3 (replay) or an *.mcap
+    (live flight) bag. Returns (px, py, off, corr): map-pixel coordinates of
+    the GPS track at the frame times in frame_t, the clock offset, and the
+    peak correlation. Returns None when the bag dir has no .ulg, no /imu0 in
+    either storage, or the correlation is too weak (< 0.3).
     """
     import glob
-    import sqlite3
     from pyulog import ULog
-    from bag_reader import parse_imu
 
     ulgs = sorted(glob.glob(os.path.join(bag_dir, '*.ulg')))
-    db3s = sorted(glob.glob(os.path.join(bag_dir, '*.db3')))
-    if not ulgs or not db3s or len(frame_t) == 0:
+    if not ulgs or len(frame_t) == 0:
+        return None
+    t_imu, gz = bag_imu_gyro_z(bag_dir)
+    if t_imu is None:
         return None
     u = ULog(ulgs[0])
     att = gps = None
@@ -309,20 +358,6 @@ def bag_gps_truth(bag_dir, frame_t, off_x, off_y):
                    d.data['latitude_deg'][ok], d.data['longitude_deg'][ok])
     if att is None or gps is None:
         return None
-
-    # bag /imu0 gyro-z on HEADER stamps — same bridge clock as the images
-    db = sqlite3.connect(f'file:{db3s[0]}?mode=ro', uri=True)
-    try:
-        tid = dict(db.execute('SELECT name,id FROM topics')).get('/imu0')
-        if tid is None:
-            return None
-        rows = db.execute(
-            'SELECT timestamp,data FROM messages WHERE topic_id=? '
-            'ORDER BY timestamp', (tid,)).fetchall()
-    finally:
-        db.close()
-    t_imu = np.array([parse_imu(b)[0] for _, b in rows])
-    gz = np.array([parse_imu(b)[1][2] for _, b in rows])
 
     # clock offset (ulog_t = bag_t + off) via gyro-z / yaw-rate correlation
     fr = np.gradient(att[1], att[0])
@@ -590,13 +625,13 @@ def bag_fcu_streams(bag_dir, R_fcu2cam):
     rad (unwrapped) / (v_east, v_north) m/s; all None when the bag has no
     ULog or the correlation is too weak."""
     import glob
-    import sqlite3
     from pyulog import ULog
-    from bag_reader import parse_imu
 
     ulgs = sorted(glob.glob(os.path.join(bag_dir, '*.ulg')))
-    db3s = sorted(glob.glob(os.path.join(bag_dir, '*.db3')))
-    if not ulgs or not db3s:
+    if not ulgs:
+        return None, None, None, None
+    t_imu, gz = bag_imu_gyro_z(bag_dir)
+    if t_imu is None:
         return None, None, None, None
     u = ULog(ulgs[0])
     att = alt = vel = None
@@ -633,18 +668,6 @@ def bag_fcu_streams(bag_dir, R_fcu2cam):
     if att is None or alt is None or vel is None:
         return None, None, None, None
 
-    db = sqlite3.connect(f'file:{db3s[0]}?mode=ro', uri=True)
-    try:
-        tid = dict(db.execute('SELECT name,id FROM topics')).get('/imu0')
-        if tid is None:
-            return None, None, None, None
-        rows = db.execute(
-            'SELECT timestamp,data FROM messages WHERE topic_id=? '
-            'ORDER BY timestamp', (tid,)).fetchall()
-    finally:
-        db.close()
-    t_imu = np.array([parse_imu(b)[0] for _, b in rows])
-    gz = np.array([parse_imu(b)[1][2] for _, b in rows])
     fr = np.gradient(att[1], att[0])
 
     def corr_at(off):

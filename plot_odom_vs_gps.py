@@ -150,7 +150,13 @@ def main():
 
     ev_t, ev_x, ev_y = read_ev_bag(bag_dir, args.ev_topic)
     fin = np.isfinite(ev_x)
-    ct, xt, yt = load_fixes(run_dir)
+    npz_p = os.path.join(run_dir, 'replay_log.npz')
+    if os.path.exists(npz_p):
+        ct, xt, yt = load_fixes(run_dir)
+    else:
+        print('WARNING: %s missing (killed before flush?) — plotting EV + '
+              'GPS truth without MCL fix markers' % npz_p)
+        ct, xt, yt = None, np.array([]), np.array([])
     print('/mcl/odom: %d msgs, %d finite poses (%.1f%% pose duty)'
           % (len(ev_t), fin.sum(), 100.0 * fin.mean()))
 
@@ -160,8 +166,9 @@ def main():
             os.path.dirname(os.path.abspath(__file__)))
         tr = bag_gps_truth(args.fly, ev_t[fin], OFF_X, OFF_Y)
         if tr is None:
-            print('WARNING: GPS truth unavailable for %s (no .ulg/.db3, no '
-                  '/imu0, or corr < 0.3) - plotting without truth' % args.fly)
+            print('WARNING: GPS truth unavailable for %s (no .ulg, no /imu0 '
+                  'in .db3/.mcap, or corr < 0.3) - plotting without truth'
+                  % args.fly)
             gps_x = gps_y = None
         else:
             gpx, gpy, off, corr = tr
@@ -174,9 +181,10 @@ def main():
             gps_y = np.interp(ev_t, seg_t, gy)
             gps_x[(ev_t < seg_t[0]) | (ev_t > seg_t[-1])] = np.nan
             gps_y[(ev_t < seg_t[0]) | (ev_t > seg_t[-1])] = np.nan
-            for k in np.where(np.diff(ct) > 3.0)[0]:
-                m = (ev_t > ct[k]) & (ev_t < ct[k + 1])
-                gps_x[m] = gps_y[m] = np.nan
+            if ct is not None:
+                for k in np.where(np.diff(ct) > 3.0)[0]:
+                    m = (ev_t > ct[k]) & (ev_t < ct[k + 1])
+                    gps_x[m] = gps_y[m] = np.nan
             err = np.hypot(ev_x[fin] - gx, ev_y[fin] - gy)
             print('GPS truth: clock offset %+.3f s, corr %.3f' % (off, corr))
             print('fused err vs GPS: median %.2f  p90 %.2f  max %.2f m'
@@ -196,8 +204,9 @@ def main():
                 label='GPS truth (ULog)')
     ax.plot(ev_x, ev_y, '-', color='#0057E7', lw=1.5, zorder=2,
             label='fused odometry %s (gaps = pose invalid)' % args.ev_topic)
-    ax.plot(xt, yt, 'o', color='#E63946', ms=4, mfc='none', mew=0.9,
-            zorder=3, label='MCL fixes')
+    if xt.size:
+        ax.plot(xt, yt, 'o', color='#E63946', ms=4, mfc='none', mew=0.9,
+                zorder=3, label='MCL fixes')
     ax.set_xlabel('east [m]')
     ax.set_ylabel('north [m]')
     ax.set_aspect('equal')

@@ -217,26 +217,45 @@ stop_recorder() {
 cleanup() {
   [ "$CLEANED" = 1 ] && return
   CLEANED=1
-  log "shutting down (MCL npz flush can take ~15 s) ..."
-  # 1. SIGINT ros2 launch -> mcl_node writes replay_log.npz on shutdown.
-  #    Signal the launch process itself (in backgrounded/daemon mode the
-  #    tracked PID is the tee at the end of the pipeline), then the pipe.
+  log "shutting down (MCL npz flush can take ~30 s) ..."
+  # 1. SIGINT mcl_node DIRECTLY. In setsid/daemon mode ros2 launch does not
+  #    reliably forward SIGINT to spawned nodes, and the npz flush happens in
+  #    the node's shutdown handler (observed: flight02 lost replay_log.npz).
+  #    Then signal the launch process; wait for the node to finish writing.
+  pkill -INT -f '/lib/ov_mcl/mcl_node' 2>/dev/null
   pkill -INT -f 'ros2 launch ov_mcl mcl_localization' 2>/dev/null
   if [ -n "$LAUNCH_PID" ] && kill -0 "$LAUNCH_PID" 2>/dev/null; then
     kill -INT "$LAUNCH_PID" 2>/dev/null
-    for _ in $(seq 1 30); do
-      kill -0 "$LAUNCH_PID" 2>/dev/null || break
-      sleep 1
-    done
-    kill "$LAUNCH_PID" 2>/dev/null
   fi
+  for _ in $(seq 1 40); do
+    pgrep -f '/lib/ov_mcl/mcl_node' >/dev/null 2>&1 || break
+    sleep 1
+  done
+  if pgrep -f '/lib/ov_mcl/mcl_node' >/dev/null 2>&1; then
+    log "mcl_node did not exit after SIGINT — SIGTERM (npz may be incomplete)"
+    pkill -TERM -f '/lib/ov_mcl/mcl_node' 2>/dev/null
+    sleep 3
+  fi
+  [ -n "$LAUNCH_PID" ] && kill "$LAUNCH_PID" 2>/dev/null
   # 2. stop recorder(s) so the bag tail is flushed (no useless tail data)
   for pid in $REC_PIDS; do stop_recorder "$pid"; done
   # 3. SchurVINS + bridge + agent do not always die with the launch
   pkill -f run_subscribe_msckf 2>/dev/null
   [ -n "$BRIDGE_PID" ] && kill "$BRIDGE_PID" 2>/dev/null
+  pkill -f fcu_pose_bridge.py 2>/dev/null
   if [ "$START_AGENT" = 1 ] && [ -n "$AGENT_PID" ]; then
     kill "$AGENT_PID" 2>/dev/null
+  fi
+  npz="$OUT_DIR/replay_log.npz"
+  if [ -f "$npz" ]; then
+    log "replay_log.npz OK ($(du -h "$npz" | cut -f1))"
+  elif grep -q 'no frames processed' "$LOG_DIR/mcl_launch.log" 2>/dev/null; then
+    log "no replay_log.npz: node processed 0 frames (expected on bench/"
+    log "low-altitude runs — point init waits for coverage >= 88 m, i.e."
+    log "roughly >= 44 m altitude). Airborne runs WILL write it."
+  else
+    log "WARNING: $npz missing and node logged processed frames — node was"
+    log "killed before flush? tail: $LOG_DIR/mcl_launch.log"
   fi
   log "done. MCL output: $OUT_DIR"
   if [ "$DO_RECORD" = 1 ]; then
@@ -248,31 +267,78 @@ cleanup() {
 trap cleanup INT TERM
 
 # ----------------------------- preflight ------------------------------------
-if ! ros2 topic list 2>/dev/null | grep -q '^/cam0/image_raw$'; then
-  log "WARNING: /cam0/image_raw not visible on domain $DOMAIN — start the"
-  log "         camera bridge in another terminal (same ROS_DOMAIN_ID=$DOMAIN)."
+# ros2 bag record exits if a requested topic never appears — wait for the
+# camera explicitly instead of failing the recorder with an opaque error.
+CAM_NEEDED=0
+if [ "$DO_RECORD" = 1 ]; then
+  case " $IMG_TOPICS $SINGLE_TOPICS " in
+    *'/cam0/image_raw'*) CAM_NEEDED=1;;
+  esac
+fi
+if [ "$CAM_NEEDED" = 1 ]; then
+  if ! ros2 topic list 2>/dev/null | grep -q '^/cam0/image_raw$'; then
+    log "waiting up to 20 s for /cam0/image_raw (start camera bridge: ~/start_camera.sh)"
+    for _ in $(seq 1 20); do
+      ros2 topic list 2>/dev/null | grep -q '^/cam0/image_raw$' && break
+      sleep 1
+    done
+  fi
+  if ! ros2 topic list 2>/dev/null | grep -q '^/cam0/image_raw$'; then
+    log "FATAL: /cam0/image_raw not visible on domain $DOMAIN. Start the"
+    log "       camera bridge first (nohup ~/start_camera.sh ... &), same domain."
+    exit 1
+  fi
+  log "camera present"
+else
+  if ! ros2 topic list 2>/dev/null | grep -q '^/cam0/image_raw$'; then
+    log "WARNING: /cam0/image_raw not visible (ok for non-camera runs)"
+  fi
 fi
 if [ "$START_BRIDGE" = 1 ] && [ ! -f "$BRIDGE" ]; then
   log "FATAL: bridge not found: $BRIDGE"; exit 1
 fi
 
 # ----------------------------- 1. agent -------------------------------------
+wait_fmu() {  # $1 = deadline seconds — /fmu/out/vehicle_attitude visible?
+  local t0=$SECONDS
+  while [ $((SECONDS - t0)) -lt "$1" ]; do
+    ros2 topic list 2>/dev/null | grep -q '^/fmu/out/vehicle_attitude$' && return 0
+    sleep 1
+  done
+  return 1
+}
+
 if [ "$START_AGENT" = 1 ]; then
-  if ros2 topic list 2>/dev/null | grep -q '^/fmu/out/vehicle_attitude$'; then
+  if wait_fmu 2; then
     log "agent already serving /fmu topics — not starting another"
     START_AGENT=0
   else
     if [ ! -x "$AGENT_BIN" ]; then
       log "FATAL: agent binary not found: $AGENT_BIN"; exit 1
     fi
+    if ss -uln 2>/dev/null | grep -q ':8888 '; then
+      log "FATAL: UDP 8888 already bound by another process, but no /fmu"
+      log "       topics are visible (stale/zombie agent?). Kill it first:"
+      ss -ulnp 2>/dev/null | grep ':8888 '
+      log "       or start this run with --no-agent once you have a working"
+      log "       agent in another terminal."
+      exit 1
+    fi
     log "starting uXRCE-DDS agent (domain $DOMAIN, port 8888)"
     "$AGENT_BIN" udp4 -p 8888 -d 0 >"$LOG_DIR/agent.log" 2>&1 &
     AGENT_PID=$!
-    sleep 3
-    if ! ros2 topic list 2>/dev/null | grep -q '^/fmu/out/vehicle_attitude$'; then
-      log "WARNING: no /fmu/out/vehicle_attitude yet (FCU powered? client connected?)"
-      log "         see $LOG_DIR/agent.log — continuing anyway"
+    # FCU client connect + topic advertisement takes ~5 s (bench observed)
+    if ! wait_fmu 15; then
+      if ! kill -0 "$AGENT_PID" 2>/dev/null; then
+        log "FATAL: agent process exited — $LOG_DIR/agent.log"; tail -10 "$LOG_DIR/agent.log"
+        cleanup; exit 1
+      fi
+      log "FATAL: agent up 15 s but FCU never connected (no /fmu topics)."
+      log "       Is the FCU powered and its agent IP set to this companion?"
+      log "       Tail: $LOG_DIR/agent.log"
+      cleanup; exit 1
     fi
+    log "FCU agent link established"
   fi
 fi
 
@@ -289,7 +355,8 @@ if [ "$DO_RECORD" = 1 ]; then
     local pid=$!
     sleep 3
     if ! kill -0 "$pid" 2>/dev/null; then
-      log "FATAL: recorder for $bdir failed — $LOG_DIR/record_$(basename "$bdir").log"
+      log "FATAL: recorder for $bdir failed — tail of its log:"
+      tail -20 "$LOG_DIR/record_$(basename "$bdir").log" >&2
       cleanup; exit 1
     fi
     REC_PIDS="$REC_PIDS $pid"
@@ -308,14 +375,50 @@ fi
 
 # ----------------------------- 3. FCU bridge --------------------------------
 if [ "$START_BRIDGE" = 1 ]; then
-  python3 "$BRIDGE" >"$LOG_DIR/bridge.log" 2>&1 &
+  # Run the bridge under the SAME UDP-only FastDDS profile as the data
+  # recorder so its publisher is reachable over UDP by the recorder and
+  # every profile-matched subscriber.
+  if [ -f "$UDP_PROFILE" ]; then
+    env FASTRTPS_DEFAULT_PROFILES_FILE="$UDP_PROFILE" python3 "$BRIDGE" \
+      >"$LOG_DIR/bridge.log" 2>&1 &
+  else
+    python3 "$BRIDGE" >"$LOG_DIR/bridge.log" 2>&1 &
+  fi
   BRIDGE_PID=$!
   sleep 2
-  if ! timeout 8 ros2 topic hz "$FCU_TOPIC" 2>/dev/null | grep -q average; then
-    log "WARNING: no data on $FCU_TOPIC yet (z_valid? attitude?) — MCL will"
-    log "         fall back to VIO attitude/alt until it appears"
+  if ! kill -0 "$BRIDGE_PID" 2>/dev/null; then
+    log "FATAL: fcu_pose_bridge died at startup — tail of its log:"
+    tail -15 "$LOG_DIR/bridge.log" >&2
+    cleanup; exit 1
+  fi
+  # The bridge's OWN log line is the authoritative "data flows FCU -> bridge"
+  # signal (it fires on the first z_valid pose). An external CLI subscriber in
+  # this just-started DDS graph is unreliable (multi-NIC FastDDS SHM/UDP
+  # negotiation; observed: 50 Hz publisher, external echo 30 s late, manual
+  # echo from a settled shell works).
+  for _ in $(seq 1 30); do
+    if grep -q 'first valid FCU pose' "$LOG_DIR/bridge.log" 2>/dev/null; then
+      br=1; break
+    fi
+    kill -0 "$BRIDGE_PID" 2>/dev/null || { br=0; break; }
+    sleep 1
+  done
+  if [ "${br:-0}" != 1 ]; then
+    log "FATAL: bridge produced no valid FCU pose in 30 s (FCU z_valid?"
+    log "       agent linked? FCU booted?). Tail of bridge log:"
+    tail -15 "$LOG_DIR/bridge.log" >&2
+    cleanup; exit 1
+  fi
+  # Profile-matched external confirmation that the topic is receivable
+  # (recorder-equivalent subscriber), only — informational, non-fatal.
+  prof_env=(); [ -f "$UDP_PROFILE" ] && prof_env=(env FASTRTPS_DEFAULT_PROFILES_FILE="$UDP_PROFILE")
+  if timeout 15 "${prof_env[@]}" ros2 topic echo "$FCU_TOPIC" --once \
+        --timeout 12 >/dev/null 2>&1; then
+    log "FCU bridge live AND externally receivable on $FCU_TOPIC"
   else
-    log "FCU bridge live on $FCU_TOPIC (~50 Hz)"
+    log "FCU bridge producing poses (log confirmed); external probe"
+    log "  not matched in time — recorder capture will be verified in the"
+    log "  bag. If /fcu/local_position/pose count is 0, raise SHM discovery."
   fi
 fi
 
