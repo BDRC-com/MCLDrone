@@ -134,6 +134,85 @@ def parse_waypoints(text):
     return wps
 
 
+# ------------------------------------------------------------- geo / QGC plan
+# Same Web-Mercator projection as mcl_node/map tiles: global z17 mercator
+# px + geo offset -> stitched-map px -> map ENU metres about the map centre.
+def ll_to_map_xy(lat, lon, zoom, gsd, cx_px, cy_px, off_x, off_y):
+    n = 2.0 ** zoom * 256.0
+    gx = (lon + 180.0) / 360.0 * n
+    gy = (1.0 - math.asinh(math.tan(math.radians(lat))) / math.pi) / 2.0 * n
+    px, py = gx + off_x, gy + off_y
+    return (px - cx_px) * gsd, (cy_px - py) * gsd
+
+
+# MAVLink commands used in QGC plans
+_NAV_TAKEOFF = 22
+_NAV_WAYPOINT = 16
+_NAV_LAND = 21
+_DO_CHANGE_SPEED = 178
+_MAV_FRAME_GLOBAL = 0
+_MAV_FRAME_GLOBAL_RELATIVE_ALT = 3
+_MAV_FRAME_GLOBAL_TERRAIN_ALT = 10
+
+
+def parse_qgc_plan(path, zoom, gsd, cx_px, cy_px, off_x, off_y, cruise_alt,
+                   default_speed):
+    """Read a QGroundControl .plan (GeoJSON) -> (origin_xy, waypoints).
+
+    Waypoints are (east_m, north_m, alt_m_above_home, speed_mps). Only
+    NAV_TAKEOFF / NAV_WAYPOINT / NAV_LAND / DO_CHANGE_SPEED are consumed;
+    the takeoff item gives the local origin (its geo point == QGC home),
+    waypoint altitudes are converted to home-relative, the trailing land
+    item is dropped (mission exhaustion drives the guard's AUTO.LAND), and
+    DO_CHANGE_SPEED sets the speed of every following waypoint until the
+    next speed command. Coordinate/yaw/accept-radius nuances of QGC are not
+    replicated (velocity offboard controller points at each waypoint and
+    the internal acceptance radius applies).
+    """
+    import json
+    with open(path, 'r') as f:
+        plan = json.load(f)
+    items = plan.get('mission', {}).get('items', [])
+    home = plan.get('mission', {}).get('plannedHomePosition')
+    origin = None
+    if home:
+        origin = ll_to_map_xy(home[0], home[1], zoom, gsd, cx_px, cy_px,
+                              off_x, off_y)
+        home_amsl = float(home[2])
+    else:
+        home_amsl = 0.0
+    wps, speed = [], default_speed
+    for it in items:
+        cmd = int(it.get('command', 0))
+        frame = int(it.get('frame', 3))
+        p = it.get('params', [0] * 7)
+        if cmd == _DO_CHANGE_SPEED:
+            # p2 = speed m/s (0 restores default); ignore throttle(0)/alt(1)
+            speed = default_speed if float(p[2]) <= 0.0 else float(p[2])
+            continue
+        if cmd not in (_NAV_TAKEOFF, _NAV_WAYPOINT, _NAV_LAND):
+            continue
+        lat, lon, alt = float(p[5]), float(p[6]), float(p[7])
+        if frame == _MAV_FRAME_GLOBAL:
+            alt = alt - home_amsl             # AMSL -> above home
+        # frame 3 (relative home) and 10 (AGL): use as metres already
+        e, n = ll_to_map_xy(lat, lon, zoom, gsd, cx_px, cy_px, off_x, off_y)
+        if cmd == _NAV_TAKEOFF:
+            if origin is None:
+                origin = (e, n)
+            continue                          # guard performs the climb
+        if cmd == _NAV_LAND:
+            continue                          # guard performs AUTO.LAND
+        walt = alt if alt > 0.5 else cruise_alt
+        wps.append((e, n, walt, min(default_speed, speed)))
+    if origin is None:
+        raise SystemExit('QGC plan has no takeoff/home position — cannot set '
+                         'the local origin')
+    if not wps:
+        raise SystemExit('QGC plan contains no NAV_WAYPOINT items')
+    return origin, wps
+
+
 class MissionManager(Node):
 
     def __init__(self):
@@ -145,24 +224,72 @@ class MissionManager(Node):
 
         # --- mission ----------------------------------------------------
         self.mission_mode = str(param('mission_mode', 'feedforward'))
-        self.waypoints = parse_waypoints(param('waypoints', ''))
+        cruise = float(param('cruise_alt', 50.0))
+        self.v_max = float(param('v_max', 12.0))
+        # Map projection used when waypoints are given as lat/lon or via a
+        # QGC plan (must match the deployed map + the MCL launch offsets).
+        map_zoom = int(param('map_zoom', 17))
+        map_gsd = float(param('map_gsd', 1.1))
+        map_cx = float(param('map_center_px', 2560.0))
+        map_cy = map_cx
+        map_off_x = float(param('map_geo_offset_x', -27449088.0))
+        map_off_y = float(param('map_geo_offset_y', -14586624.0))
+
+        origin_x = float(param('local_origin_map_x', 0.0))
+        origin_y = float(param('local_origin_map_y', 0.0))
+        qgc_plan_path = str(param('qgc_plan', '')).strip()
+        wps_ll_text = str(param('waypoints_ll', '')).strip()
+        wps_xy = parse_waypoints(param('waypoints', ''))
+
+        self.waypoints = []             # normalized (east, north, alt, speed)
+        if qgc_plan_path:
+            (ox, oy), qwps = parse_qgc_plan(
+                qgc_plan_path, map_zoom, map_gsd, map_cx, map_cy,
+                map_off_x, map_off_y, cruise, self.v_max)
+            # QGC plan's own home overrides an explicit local origin so the
+            # route is flown relative to the takeoff point exactly as drawn.
+            origin_x, origin_y = ox, oy
+            self.waypoints = qwps
+            self.get_logger().info(
+                'loaded QGC plan %s: %d waypoints, origin (%.1f, %.1f) m'
+                % (qgc_plan_path, len(qwps), ox, oy))
+        elif wps_ll_text:
+            # "lat,lon[,alt[,speed]]; ..."  (WGS-84, alt m above home)
+            for chunk in wps_ll_text.split(';'):
+                chunk = chunk.strip()
+                if not chunk:
+                    continue
+                f = [float(v) for v in chunk.split(',')]
+                lat, lon = f[0], f[1]
+                alt = f[2] if len(f) > 2 and f[2] > 0.5 else cruise
+                spd = min(self.v_max, f[3]) if len(f) > 3 and f[3] > 0 else self.v_max
+                e, n = ll_to_map_xy(lat, lon, map_zoom, map_gsd, map_cx, map_cy,
+                                    map_off_x, map_off_y)
+                self.waypoints.append((e, n, alt, spd))
+            self.get_logger().info(
+                'loaded %d lat/lon waypoints' % len(self.waypoints))
+        elif wps_xy:
+            # legacy map-ENU metres, uniform cruise altitude / v_max
+            self.waypoints = [(x, y, cruise, self.v_max) for x, y in wps_xy]
+
         if self.mission_mode == 'waypoints' and not self.waypoints:
-            raise SystemExit('mission_mode=waypoints needs waypoints:="x,y; ..."')
+            raise SystemExit(
+                'mission_mode=waypoints needs one of: qgc_plan:=<file>, '
+                'waypoints_ll:="lat,lon;...", or waypoints:="x,y;..."')
         # --- guard limits -----------------------------------------------
         self.guard = Guard(
-            cruise_alt=param('cruise_alt', 50.0),
+            cruise_alt=cruise,
             takeoff_max_s=param('takeoff_max_s', 120.0),
             hold_budget_s=param('hold_budget_s', 180.0),
             return_max_s=param('return_max_s', 60.0),
             mission_max_s=param('mission_max_s', 900.0),
             margin_m=param('margin_m', 1000.0),
             map_half_m=param('map_half_m', 2500.0))
-        self.v_max = float(param('v_max', 12.0))
         self.preflight_max_s = float(param('preflight_max_s', 180.0))
         # --- EV frame ---------------------------------------------------
         self.ev_frame = str(param('ev_frame', 'map'))
-        self.local_origin_map_x = float(param('local_origin_map_x', 0.0))
-        self.local_origin_map_y = float(param('local_origin_map_y', 0.0))
+        self.local_origin_map_x = origin_x
+        self.local_origin_map_y = origin_y
         # EKF2 global origin = deployment-map centre (z17_5120.png px 2560,2560)
         self.set_global_origin = bool(param('set_global_origin', True))
         self.map_center_lat = float(param('map_center_lat', 22.8445297))
@@ -227,6 +354,15 @@ class MissionManager(Node):
             'margin=%.0f m (waiting for fmu + /mcl/odom)'
             % (self.mission_mode, self.ev_frame, self.guard.cruise_alt,
                self.guard.margin_m))
+        if self.waypoints:
+            self.get_logger().info(
+                'route: %d wp, origin=(%.1f,%.1f) m; first=(%.1f,%.1f) m '
+                '%.0f m AGL @%.1f m/s; last=(%.1f,%.1f) m'
+                % (len(self.waypoints), self.local_origin_map_x,
+                   self.local_origin_map_y,
+                   self.waypoints[0][0], self.waypoints[0][1],
+                   self.waypoints[0][2], self.waypoints[0][3],
+                   self.waypoints[-1][0], self.waypoints[-1][1]))
 
     # ------------------------------------------------------------------ subs
     def on_status(self, msg):
@@ -355,11 +491,16 @@ class MissionManager(Node):
                  max(-self.v_max, min(self.v_max, vz))], yaw)
 
     def waypoint_velocity(self):
-        """(v_ned, yaw_ned) toward the active waypoint, or None without a fix."""
+        """(v_ned, yaw_ned) toward the active waypoint, or None without a fix.
+
+        Waypoints are (east_m, north_m, alt_m, speed_mps); horizontal motion
+        is a P-controller clamped to that waypoint's speed, altitude is held
+        toward the waypoint altitude (bounded), heading points along track.
+        """
         if self.ev_map_pos is None:
             return None
         while self.wp_i < len(self.waypoints):
-            wx, wy = self.waypoints[self.wp_i]
+            wx, wy, _wa, _ws = self.waypoints[self.wp_i]
             dx, dy = wx - self.ev_map_pos[0], wy - self.ev_map_pos[1]
             dist = math.hypot(dx, dy)
             if dist > WP_RADIUS_M:
@@ -369,16 +510,16 @@ class MissionManager(Node):
             self.wp_i += 1
         if self.wp_i >= len(self.waypoints):
             return None                     # mission done -> guard lands
-        wx, wy = self.waypoints[self.wp_i]
+        wx, wy, w_alt, w_spd = self.waypoints[self.wp_i]
         dx, dy = wx - self.ev_map_pos[0], wy - self.ev_map_pos[1]
         dist = max(1e-3, math.hypot(dx, dy))
-        sp = min(self.v_max, 0.7 * dist)    # P-controller, clamped
+        sp = min(w_spd, 0.7 * dist)         # P-controller, waypoint speed cap
         v_e, v_n = sp * dx / dist, sp * dy / dist
         vz = 0.0
         alt = self.alt()
         if alt is not None:
             vz = -max(-ALT_VZ_MAX,
-                      min(ALT_VZ_MAX, ALT_KP * (self.guard.cruise_alt - alt)))
+                      min(ALT_VZ_MAX, ALT_KP * (w_alt - alt)))
         v_ned = [v_n, v_e, vz]
         return v_ned, math.atan2(v_e, v_n)  # NED yaw = atan2(east, north)
 

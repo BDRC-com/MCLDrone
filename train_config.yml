@@ -1,0 +1,129 @@
+# Configuration for train_similarity.py (mirrors sivl/configs/configuration.yml).
+#
+# To train for a NEW region, edit the "region data" entries below:
+#   1. trainingdata_bitmaps / testingdata_bitmaps -> multi-temporal area
+#      folders: each folder holds aligned, equally-sized, different-time
+#      images (year_month_N.jpg Google-Earth exports of one fixed viewport).
+#      Anchor/positive pairs are drawn from DIFFERENT temporal layers of
+#      the same location (forces time-invariant structural features, like
+#      sivl's BitmapDataset). Held-out testing areas must be spatially
+#      disjoint from the training areas. Like origin sivl, the bank grids
+#      at the images' NATIVE pixel size (no GSD resampling).
+#   2. map -> your deployment MCL map, its m/px, and geo_offset
+#      (local map px = global z17 web-mercator px + geo_offset; for a map
+#      stitched from z17 tiles with top-left tile origin (tx,ty):
+#      geo_offset = [-tx*256, -ty*256])
+#   3. flights -> your recorded flights (may be [] to skip real pairs)
+#   4. experiment names / checkpoint paths
+# then run:  --build-bank -> pretrain -> --build-real -> --finetune
+
+device: "cuda:0" # CUDA device to use.
+
+data:
+  path:
+    # ---- region data (edit per region) ----
+    trainingdata_bitmaps: # multi-temporal area folders used in training
+      woodbridge: "/home/one/GNSS-denied-Localization/datasets/woodbridge"
+      fountainhead: "/home/one/GNSS-denied-Localization/datasets/fountainhead"
+      area_1: "/home/one/GNSS-denied-Localization/datasets/huizhou/area_1" # flight/deployment area
+      area_2: "/home/one/GNSS-denied-Localization/datasets/huizhou/area_2"
+      area_4: "/home/one/GNSS-denied-Localization/datasets/huizhou/area_4"
+      area_5: "/home/one/GNSS-denied-Localization/datasets/huizhou/area_5"
+      area_6: "/home/one/GNSS-denied-Localization/datasets/huizhou/area_6"
+      area_8: "/home/one/GNSS-denied-Localization/datasets/huizhou/area_8"
+      area_9: "/home/one/GNSS-denied-Localization/datasets/huizhou/area_9"
+      area_10: "/home/one/GNSS-denied-Localization/datasets/huizhou/area_10"
+      area_11: "/home/one/GNSS-denied-Localization/datasets/huizhou/area_11"
+      area_12: "/home/one/GNSS-denied-Localization/datasets/huizhou/area_12"
+      area_13: "/home/one/GNSS-denied-Localization/datasets/huizhou/area_13"
+      area_14: "/home/one/GNSS-denied-Localization/datasets/huizhou/area_14"
+      area_15: "/home/one/GNSS-denied-Localization/datasets/huizhou/area_15"
+    testingdata_bitmaps: # held-out areas (simval during pretrain and finetune)
+      area_3: "/home/one/GNSS-denied-Localization/datasets/huizhou/area_3"
+      area_7: "/home/one/GNSS-denied-Localization/datasets/huizhou/area_7"
+    patch_bank: "/home/one/GNSS-denied-Localization/huizhou_map/patch_bank" # --build-bank / --build-real output
+
+    map: # deployment MCL map (real pairs and their negatives are cropped from it)
+      path: "/home/one/GNSS-denied-Localization/z17_5120.png"
+      gsd: 1.10 # m/pixel of the deployment map (z17 at lat 22.8 = 1.10; a wrong
+             # value scales all real-pair positives — verify before --build-real!)
+      geo_offset: [-27449088.0, -14586625.0]
+
+    flights: # recorded flights for real-pair building (--build-real)
+      - name: "bag_0001_20260831_184004"
+        run_dir: "/home/one/GNSS-denied-Localization/sample_images/mcl_test/bag0001_debug" # replay_log.npz + debug/k*_4_patch.png (MCL run with save_debug)
+        ulog: "/home/one/workspace/datasets/bag_0001_20260831_184004/08_13_15.ulg" # flight log with GPS truth
+        db3: "/home/one/workspace/datasets/bag_0001_20260831_184004/bag_0001_20260831_184004_0.db3" # rosbag db3 (IMU, for clock alignment)
+        alt_min_m: 30.0 # skip takeoff/landing frames below this altitude (cruise ~125 m)
+      - name: "bag_0001_20260908_174711"
+        run_dir: "/home/one/GNSS-denied-Localization/sample_images/mcl_test/bag174711_debug"
+        ulog: "/home/one/workspace/datasets/bag_0001_20260908_174711/log_18_2026-9-8-17-54-50.ulg"
+        db3: "/home/one/workspace/datasets/bag_0001_20260908_174711/bag_0001_20260908_174711_0.db3"
+        alt_min_m: 30.0 # cruise up to ~132 m; TRAINING flight (not in val_flights)
+      # 190020 (19:00 near-sunset flight, same area): built into real_pairs but
+      # HELD OUT from fine-tuning — it is the cross-flight validation flight
+      # (see finetune.val_flights below). The debug run_dir must have
+      # save_debug patches + replay_log (its tracking quality is irrelevant:
+      # drone patches use only that frame's tilt/altitude, and truth comes
+      # from the ulog GPS at each frame's own timestamp).
+      - name: "bag_0001_20260831_190020"
+        run_dir: "/home/one/GNSS-denied-Localization/sample_images/mcl_test/bag0001_190020_debug"
+        ulog: "/home/one/workspace/datasets/bag_0001_20260831_190020/08_32_59.ulg"
+        db3: "/home/one/workspace/datasets/bag_0001_20260831_190020/bag_0001_20260831_190020_0.db3"
+        alt_min_m: 30.0 # cruise ~130 m
+
+    # Model that rotation-labels real pairs: must score TRUE pairs reliably
+    # high. The original sivl Sweden checkpoint generalizes across regions;
+    # alternatively use your region's pretrain checkpoint.
+    label_model_checkpoint: "/home/one/GNSS-denied-Localization/sivl/checkpoints/training_4_epoch_00200_of_200.pt"
+
+training: # pretrain on multi-temporal bank pairs (different-time same-location)
+  checkpoint_saving_path: "/home/one/GNSS-denied-Localization/checkpoints_huizhou/"
+  initial_model_checkpoint: "/home/one/GNSS-denied-Localization/checkpoints_huizhou/huizhou_mt_1_epoch_300_of_1000.pt"
+  use_only_network_params: False
+  numEpochs: 1000
+  save_every: 100
+  batchsize: 800
+  lr: 0.00001
+  num_workers: 6
+  experiment_name: "huizhou_mt_1"
+  # --- sivl BitmapDataset sampling parameters (see sivl/datasourcing/
+  #     BitmapDataset.py and TemporalBankDataset in train_similarity.py) ---
+  marginBetweenSamples_px: 0 # grid step = 96 + this (0 = adjacent samples, no stride)
+  apShiftingStd: 20 # centerpoint jitter, drawn once per node at --build-bank
+  rotationErrorStd_deg: 0.5 # positive-pair rotation noise
+  translationErrorStd_px: 0.5 # positive-pair translation noise
+  homographyCornerErrorStd_px: 1.0 # positive-pair corner noise
+  scaleStd: 0.1 # shared anchor/positive scale draw (clamped <= 1: bank crops are 136 px)
+  # --- real-pair negatives in --finetune (cropped from the deployment map) ---
+  nearNegativeMin_px: 160 # nearby-negative ring (map px; observed
+  nearNegativeMax_px: 600 #  false-peak distances)
+  negativeMixture: {near: 0.3, far: 0.5, rotated: 0.2}
+
+finetune: # mixed real + simulated training after pretrain (--finetune)
+  checkpoint_saving_path: "/home/one/GNSS-denied-Localization/checkpoints_huizhou/"
+  initial_model_checkpoint: "/home/one/GNSS-denied-Localization/checkpoints_huizhou/huizhou_mt_1_epoch_1000_of_1000.pt" # pretrain output (after the sivl resume, saves land at epochs 300..1000; pick any)
+  use_only_network_params: True
+  numEpochs: 40
+  save_every: 10
+  batchsize: 800
+  lr: 0.00001
+  num_workers: 6
+  p_real: 0.3 # fraction of real-pair items per batch
+  rotationErrorStd_deg: 3.0 # real-pair positive rotation jitter
+  positiveScaleMin: 0.75 # real-pair positive scale jitter (covers coverage
+  positiveScaleMax: 1.1 #  estimation error)
+  # Cross-flight validation: ALL frames of the listed flights go to realval
+  # (the model never trains on them). In-flight frame splits (every 5th frame)
+  # memorize the training flight's lighting/terrain and reported "win 100%"
+  # while a different flight false-locked (2026-09-09: ft trained on 184004
+  # scored truth 1.000 on 184004 but 0.003 on held-out 190020). Empty list =
+  # legacy every-5th-frame in-flight split.
+  val_flights: ["bag_0001_20260831_190020"]
+  experiment_name: "huizhou_ft_mt_1"
+
+evaluation:
+  model_checkpoint: "/home/one/GNSS-denied-Localization/checkpoints_huizhou/huizhou_ft_mt_1_epoch_040_of_40.pt"
+
+sampledimensions:
+  dimension_px: 96 # network input size (sivl sampledimensions)

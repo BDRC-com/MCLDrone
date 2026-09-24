@@ -5,3 +5,7 @@ maps/*
 test/*
 !test/.gitkeep
 __pycache__/
+RUN_LIVE_PARAMS.md
+TRAINING.md
+MANUAL_FALLBACK.md
+RUN.md

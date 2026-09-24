@@ -11,6 +11,9 @@
 #      --topics "..." forces a single recorder instead.
 #   3. fcu_pose_bridge.py       (unless --no-bridge; FCU NED/FRD -> ENU/FLU)
 #   4. ros2 launch ov_mcl       (SchurVINS + MCL node, LIVE mode: no bag:=)
+#   5. mission_manager.py       (ONLY with --manager; EV->PX4 OFFBOARD
+#      autopilot that arms + flies waypoints. Without it MCL is observe-only
+#      and you fly from QGC.)
 #
 # --daemon / -D: detach the WHOLE stack (new session) so an SSH disconnect
 #                 cannot stop it in flight; console -> /tmp/run_live_<name>.
@@ -55,6 +58,24 @@ STRIDE="5"
 YAW_CAL="-1,1.3"
 FCU_TOPIC="/fcu/local_position/pose"
 EXTRA_ARGS=""
+# --- mission_manager (optional OFFBOARD autopilot; off = observe only) ------
+START_MANAGER=0
+MGR_MODE="waypoints"            # waypoints | feedforward
+WAYPOINTS=""                    # "x,y; x,y" map-ENU metres (legacy)
+WAYPOINTS_LL=""                 # "lat,lon[,alt[,speed]]; ..." WGS-84
+QGC_PLAN=""                     # path to a QGroundControl .plan file
+ORIGIN_X="0.0"                  # takeoff point in map ENU metres
+ORIGIN_Y="0.0"
+MAP_ZOOM="17"                   # tile zoom of the deployed map
+MAP_GSD="1.1"                   # m/px of the deployed map
+MAP_CENTER_PX="2560.0"          # centre px (half of z17_5120 edge)
+CRUISE_ALT="50.0"
+V_MAX="12.0"
+EV_FRAME="map"                  # map | first_fix
+MAP_CENTER_LAT="22.8445297"     # EKF2 global origin (prestage_map value)
+MAP_CENTER_LON="114.5242310"
+MGR_EXTRA=""
+# MANAGER_PY resolved after SCRIPT_DIR is set below.
 # Recorders are SPLIT by design: heavy image frames in one bag, high-rate
 # small messages in another. A single recorder loses IMU samples (the CyperStereo
 # delivers /imu0 in ~50 ms bursts into a keep-last queue; while the writer
@@ -78,6 +99,7 @@ ORIG_ARGS=("$@")
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BRIDGE="$SCRIPT_DIR/fcu_pose_bridge.py"
+MANAGER_PY="$SCRIPT_DIR/mission_manager.py"
 # FastDDS UDP-only profile for the small-message recorder (SHM sheds bursty
 # high-rate streams on FastDDS 2.6 — see fastdds_udp_only.xml header)
 UDP_PROFILE="$SCRIPT_DIR/fastdds_udp_only.xml"
@@ -109,6 +131,23 @@ while [ $# -gt 0 ]; do
     --data-topics) DATA_TOPICS="$2"; shift 2;;
     --topics)      SINGLE_TOPICS="$2"; shift 2;;
     --extra)       EXTRA_ARGS="$2"; shift 2;;
+    --manager)         START_MANAGER=1; shift;;
+    --no-manager)      START_MANAGER=0; shift;;
+    --mgr-mode)        MGR_MODE="$2"; shift 2;;
+    --waypoints)       WAYPOINTS="$2"; shift 2;;
+    --waypoints-ll)    WAYPOINTS_LL="$2"; shift 2;;
+    --qgc-plan)        QGC_PLAN="$2"; shift 2;;
+    --origin-x)        ORIGIN_X="$2"; shift 2;;
+    --origin-y)        ORIGIN_Y="$2"; shift 2;;
+    --map-zoom)        MAP_ZOOM="$2"; shift 2;;
+    --map-gsd)         MAP_GSD="$2"; shift 2;;
+    --map-center-px)   MAP_CENTER_PX="$2"; shift 2;;
+    --cruise-alt)      CRUISE_ALT="$2"; shift 2;;
+    --v-max)           V_MAX="$2"; shift 2;;
+    --ev-frame)        EV_FRAME="$2"; shift 2;;
+    --map-center-lat)  MAP_CENTER_LAT="$2"; shift 2;;
+    --map-center-lon)  MAP_CENTER_LON="$2"; shift 2;;
+    --mgr-extra)       MGR_EXTRA="$2"; shift 2;;
     --no-agent)    START_AGENT=0; shift;;
     --no-bridge)   START_BRIDGE=0; shift;;
     --no-record)   DO_RECORD=0; shift;;
@@ -197,7 +236,7 @@ BAG_DIR="$BAG_ROOT/${NAME}_bag"       # single-recorder mode (--topics)
 LOG_DIR="/tmp/run_live_$NAME"
 mkdir -p "$OUT_DIR" "$LOG_DIR"
 
-AGENT_PID=""; REC_PIDS=""; BRIDGE_PID=""; LAUNCH_PID=""
+AGENT_PID=""; REC_PIDS=""; BRIDGE_PID=""; LAUNCH_PID=""; MGR_PID=""
 CLEANED=0
 
 log() { echo "[run_live] $*"; }
@@ -218,6 +257,18 @@ cleanup() {
   [ "$CLEANED" = 1 ] && return
   CLEANED=1
   log "shutting down (MCL npz flush can take ~30 s) ..."
+  # 0. STOP THE OFFBOARD AUTOPILOT FIRST so it ceases velocity/mode commands
+  #    to the FCU before localization goes away (safety: pilot/QGC regains
+  #    clean control). pkill by script path covers the detached python node.
+  if [ "$START_MANAGER" = 1 ]; then
+    log "stopping mission_manager (offboard setpoints) ..."
+    pkill -INT -f 'mission_manager.py' 2>/dev/null
+    for _ in $(seq 1 10); do
+      pgrep -f 'mission_manager.py' >/dev/null 2>&1 || break
+      sleep 1
+    done
+    pkill -TERM -f 'mission_manager.py' 2>/dev/null
+  fi
   # 1. SIGINT mcl_node DIRECTLY. In setsid/daemon mode ros2 launch does not
   #    reliably forward SIGINT to spawned nodes, and the npz flush happens in
   #    the node's shutdown handler (observed: flight02 lost replay_log.npz).
@@ -440,6 +491,59 @@ log "args: ${LAUNCH_ARGS[*]}"
 ros2 launch ov_mcl mcl_localization.launch.py "${LAUNCH_ARGS[@]}" \
     2>&1 | tee "$LOG_DIR/mcl_launch.log" &
 LAUNCH_PID=$!
+
+# ----------------------------- 5. mission_manager (optional) ----------------
+# OFFBOARD EV-closed-loop autopilot. OFF by default: without it the drone is
+# flown from QGC and MCL is observed only. It ARMS + enters OFFBOARD itself
+# once /mcl/odom streams, so only enable for autonomous GNSS-denied runs.
+if [ "$START_MANAGER" = 1 ]; then
+  if [ ! -f "$MANAGER_PY" ]; then
+    log "FATAL: --manager set but $MANAGER_PY not found"; cleanup; exit 1
+  fi
+  if [ "$MGR_MODE" = waypoints ] && [ -z "$WAYPOINTS" ] \
+     && [ -z "$WAYPOINTS_LL" ] && [ -z "$QGC_PLAN" ]; then
+    log "FATAL: --manager waypoints needs --waypoints, --waypoints-ll,"
+    log "       or --qgc-plan"
+    cleanup; exit 1
+  fi
+  if [ -n "$QGC_PLAN" ] && [ ! -f "$QGC_PLAN" ]; then
+    log "FATAL: QGC plan file not found: $QGC_PLAN"; cleanup; exit 1
+  fi
+  log "starting mission_manager (mode=$MGR_MODE, EV->PX4 OFFBOARD autopilot)"
+  log "  WARNING: it will ARM and switch to OFFBOARD once /mcl/odom is live"
+  log "  and the guard enters TAKEOFF. Props clear; safety pilot on RC."
+  mgr_args=(--ros-args
+    -p mission_mode:="$MGR_MODE"
+    -p ev_frame:="$EV_FRAME"
+    -p local_origin_map_x:="$ORIGIN_X"
+    -p local_origin_map_y:="$ORIGIN_Y"
+    -p cruise_alt:="$CRUISE_ALT"
+    -p v_max:="$V_MAX"
+    -p map_zoom:="$MAP_ZOOM"
+    -p map_gsd:="$MAP_GSD"
+    -p map_center_px:="$MAP_CENTER_PX"
+    -p map_geo_offset_x:="$OFF_X"
+    -p map_geo_offset_y:="$OFF_Y"
+    -p map_center_lat:="$MAP_CENTER_LAT"
+    -p map_center_lon:="$MAP_CENTER_LON")
+  [ -n "$WAYPOINTS" ]    && mgr_args+=(-p "waypoints:=$WAYPOINTS")
+  [ -n "$WAYPOINTS_LL" ] && mgr_args+=(-p "waypoints_ll:=$WAYPOINTS_LL")
+  [ -n "$QGC_PLAN" ]     && mgr_args+=(-p "qgc_plan:=$QGC_PLAN")
+  # shellcheck disable=SC2206
+  [ -n "$MGR_EXTRA" ] && mgr_args+=( $MGR_EXTRA )
+  python3 "$MANAGER_PY" "${mgr_args[@]}" \
+      >"$LOG_DIR/manager.log" 2>&1 &
+  MGR_PID=$!
+  sleep 3
+  if ! kill -0 "$MGR_PID" 2>/dev/null; then
+    log "FATAL: mission_manager died at startup — tail of its log:"
+    tail -20 "$LOG_DIR/manager.log" >&2
+    cleanup; exit 1
+  fi
+  log "mission_manager up (pid $MGR_PID) -> $LOG_DIR/manager.log"
+  log "  state monitor: rostopic echo /mission/state or tail the manager log"
+fi
+
 wait "$LAUNCH_PID"
 log "launch exited"
 cleanup
