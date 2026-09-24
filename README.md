@@ -228,7 +228,7 @@ python train_similarity.py
 
 在构建前，需要在用于预训练的包上运行一边MCL，得到所有帧的图像与GPS真值，将 ulog 与 bag 时钟对齐（陀螺 z 轴 / 偏航角速度互相关），通过 `geo_offset` 将 GPS 真值映射到地图像素，用标签模型（`train_config.label_model_checkpoint`）为每个调试块生成旋转标签。得分低于 0.5 的帧被丢弃。
 
-推荐只保存飞机巡航阶段的帧，如何运行MCL请看\[下文]\(## 2. 运行 MCL)。在上面的`train_config.yml`文件里我们选定了3个包：
+推荐只保存飞机巡航阶段的帧，如何运行MCL请看第2节“运行MCL”。在上面的`train_config.yml`文件里我们选定了3个包：
 
 - bag\_0001\_20260831\_184004
 - bag\_0001\_20260908\_174711
@@ -260,13 +260,10 @@ python train_similarity.py --finetune
 从 `train_config.finetune.initial_model_checkpoint` 初始化。实验名 `train_ft_1` →`checkpoints/train_ft_1_epoch_040_of_40.pt`（部署用检查点；也是新的 `mcl.py`/launch 默认值）。混合比例：`finetune.p_real`的真实数据对，其余为仿真块库数据对。每个 epoch 跟踪两个验证集：
 
 - `simval` — 必须保持 acc 1.000
-- `realval` — 跨飞行验证：`finetune.val_flights` 中列出的飞行
+- `realval` — 跨飞行验证：`train_config.finetune.val_flights` 中列出的飞行
   （当前为 190020）的**全部**帧；模型从不在这上面训练。这是部署
-  门禁 — 期望留出集 pos \~0.9+。帧内每隔 5 帧的划分会泄漏
-  （96 m 视野上相隔 0.2 秒的帧近乎重复）：曾在 184004 上微调的
-  模型 realval 报 1.000，却在 190020 上假锁定（留出集真值得分中位数
-  0.001）— 2026-09-09 事故。`data.path.flights` 中的所有飞行都通过
-  `--build-real` 生成数据对；`val_flights` 只控制哪些被排除在训练外。
+  门禁 — 期望留出集 pos \~0.9+。`train_config.data.path.flights` 中的所有飞行都通过
+  `--build-real` 生成数据对；`train_config.finetune.val_flights` 只控制哪些被排除在训练外。
   最终验收：在留出飞行上跑完整 MCL bag 回放（比离线块指标更强），
   外加一条从未用过的第 3 条飞行为真正的测试集。
 
