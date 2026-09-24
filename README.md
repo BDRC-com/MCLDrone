@@ -4,14 +4,14 @@ git clone https://github.com/Mastopke304/MCLDrone.git
 cd MCLDrone
 
 # Conda 训练环境
-conda env create -f environment_sivl.yml
+conda env create -f environment.yml
 # MCL 运行环境
 # 需要先安装ROS2 Humble 和 MicroXRCE-DDS agent，然后：
 sudo apt install -y python3-opencv python3-matplotlib python3-scipy python3-pandas \
   python3-yaml python3-pip python3-setuptools python3-colcon-common-extensions
 # 然后安装环境：
 source /opt/ros/humble/setup.bash
-sudo /usr/bin/python3 -m pip install -r ~/MCLDrone/requirements_drone.txt
+sudo /usr/bin/python3 -m pip install -r requirements.txt
 /usr/bin/python3 - <<'EOF'
 import torch, numpy as np, cv2
 assert torch.cuda.is_available(), "torch must see CUDA (JetPack wheel)"
