@@ -106,3 +106,15 @@ evaluation:
 
 sampledimensions:
   dimension_px: 96 # 模型输入大小，同时也是地图区块库的构建大小，非必要不动
+  # 试用更大输入：python train_similarity.py --dimension 128 [--build-bank|--finetune ...]
+  # 评估同样加 --dimension（eval_real_patches.py）。注意：
+  #   - 网络用 AdaptivePool，结构不随尺寸改变，但必须在新尺寸下重建 bank 并重训；
+  #   - bank 会写入带尺寸后缀的独立目录，与生产 96 bank 共存、互不覆盖：
+  #       配置=96 + --dimension 128 -> <patch_bank>_128/
+  #       配置=128（不加 flag）      -> <patch_bank>/
+  #     bank.zarr / meta.npz / real_pairs.npz 都在该尺寸目录内；
+  #   - bank 占用约按 (D/96)^2*2 增长：96→约49GB(参考)，128→约87GB，160→约135GB；
+  #   - 旧 96 飞行 debug patch 在 --build-real 时会被放大到新尺寸（不增加信息），
+  #     要获得真正高分辨率真实样本，需用新尺寸的 MCL 重新飞行采集；
+  #   - 部署侧 mcl.py 的 PATCH_PX 仍为 96，新尺寸 checkpoint 在运行时迁移完成前
+  #     不要直接装机使用。

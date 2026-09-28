@@ -45,7 +45,8 @@ CKPT_OLD = os.path.join(ROOT, 'sivl/checkpoints/training_4_epoch_00200_of_200.pt
 OUT_DIR = os.path.join(ROOT, 'eval_real_patches_out')
 
 GSD = 1.10            # z17_5120.png m/px (same as mcl_node default)
-PATCH_PX = 96
+import train_similarity as _ts
+PATCH_PX = _ts.PATCH_PX   # network input size; follows train_config / --dimension
 N_ROT = 180           # rotation sweep every 2 deg — the model is extremely
                       # rotation-sensitive (10 deg steps miss peaks: observed
                       # score 0.33 -> 1.00 when refined to 2 deg)
@@ -216,7 +217,20 @@ def main():
                          'patch stats, branch-embedding domain gap')
     ap.add_argument('--ckpt', default='',
                     help='override the new-model checkpoint path')
+    ap.add_argument('--dimension', type=int, default=0,
+                    help='override network input px (must match the bank and '
+                         'checkpoint); mirrors train_similarity --dimension')
     args = ap.parse_args()
+
+    if args.dimension and args.dimension != _ts.PATCH_PX:
+        import math as _math
+        # sync BOTH modules: extract_all lives in train_similarity, local
+        # scoring/plot code reads this module's PATCH_PX global.
+        _ts.PATCH_PX = args.dimension
+        _ts.BANK_PX = int(_math.ceil(args.dimension * _math.sqrt(2.0)))
+        globals()['PATCH_PX'] = args.dimension
+        print(f'[dimension override] eval at PATCH_PX={PATCH_PX} '
+              f'BANK_PX={_ts.BANK_PX}')
 
     if args.profile:
         profile_fails(args)
@@ -284,7 +298,7 @@ def main():
             if fi < args.save_sb:
                 best = int(np.argmax(st))
                 side = np.concatenate(
-                    [patch, np.full((96, 8, 3), 255, np.uint8), tp[best]],
+                    [patch, np.full((PATCH_PX, 8, 3), 255, np.uint8), tp[best]],
                     axis=1)
                 cv2.imwrite(os.path.join(
                     OUT_DIR, f'{flight[-6:]}_k{k:05d}_sb.png'),

@@ -73,7 +73,37 @@ with open(os.path.join(ROOT, 'train_config.yml')) as _f:
 
 PATCH_PX = cfg.sampledimensions.dimension_px   # network input size
 
-BANK_PX = 136           # stored bank crop (fits a rotated 96px square: 96*sqrt(2))
+# Stored bank crop must contain a rotated input square at any yaw and
+# scale<=1: inscribed square of side PATCH_PX needs PATCH_PX*sqrt(2).
+# Size-agnostic: the BranchNet adaptive pool fixes the embedding, so this
+# (and dimension_px) may be changed — but the bank must be REBUILT at the
+# new size (zarr shape is fixed), and a checkpoint trained at one size must
+# be retrained for another. Bank byte size scales ~(PATCH_PX*sqrt2/136)^2:
+#   96 -> 136 (reference, ~49 GB bank); 128 -> 182 (~87 GB);
+#   160 -> 227 (~135 GB); 256 -> 362 (~347 GB).
+def _bank_px_for(patch_px):
+    return int(math.ceil(patch_px * math.sqrt(2.0)))
+
+
+def _bank_dir_for(patch_px):
+    """Size-specific bank directory: configured patch_bank + _<size>.
+
+    The zarr shape, its sampling grid, and the built real_pairs.npz are all
+    size-specific, so each input dimension gets its own folder and they
+    coexist (a 128 build never overwrites the 96 bank). e.g.
+    patch_bank + _128 -> .../patch_bank_128/{bank.zarr,meta.npz,real_pairs.npz}
+    """
+    base = cfg.data.path.patch_bank
+    return base if patch_px == cfg.sampledimensions.dimension_px \
+        else f'{base}_{patch_px}'
+
+
+def bank_dir():
+    """Active size-specific bank dir (honors a --dimension override)."""
+    return _bank_dir_for(PATCH_PX)
+
+
+BANK_PX = _bank_px_for(PATCH_PX)
 BANK_CODEC = Blosc(cname='zstd', clevel=3, shuffle=Blosc.NOSHUFFLE)
                         # measured on real crops: 1.34x (65.8 -> ~49 GB),
                         # decode 0.07 ms/crop — cheap in DataLoader workers
@@ -255,11 +285,16 @@ def extract_all(map_rgb, px, py, src_dim, angles_deg):
 
 
 # ------------------------------------------------- drone-side simulation
-def rot_crop(src, theta_deg, scale=1.0, out=PATCH_PX, corner_noise=0.0,
+def rot_crop(src, theta_deg, scale=1.0, out=None, corner_noise=0.0,
              shift=(0.0, 0.0), rng=None):
     """Extract an `out`x`out` crop whose source is a `out*scale`-side square
     centered at src's center + shift, rotated by theta_deg. Fits in BANK_PX
-    for scale <= 1 at any theta (bounding box <= 96*sqrt(2) <= 136)."""
+    for scale <= 1 at any theta (bounding box <= PATCH_PX*sqrt(2) <= BANK_PX).
+
+    out defaults to the CURRENT module global PATCH_PX (resolved at call
+    time, not import time) so a --dimension override applies everywhere."""
+    if out is None:
+        out = PATCH_PX
     h, w = src.shape[:2]
     cx, cy = w / 2.0, h / 2.0
     th = math.radians(theta_deg)
@@ -529,8 +564,8 @@ def build_bank():
     (per-patch area/node/layer-file provenance, centers, train/val split,
     area names).
     """
-    bank_dir = cfg.data.path.patch_bank
-    os.makedirs(bank_dir, exist_ok=True)
+    bdir = bank_dir()
+    os.makedirs(bdir, exist_ok=True)
     t = cfg.training
     areas = _area_entries()
     if not areas:
@@ -597,7 +632,7 @@ def build_bank():
     # contention-free. Compression (1.34x measured) shrinks the bank from
     # 65.8 GB raw to ~49 GB — the page cache covers far more of it, which
     # is what actually stops the disk thrash during training.
-    store = os.path.join(bank_dir, 'bank.zarr')
+    store = os.path.join(bdir, 'bank.zarr')
     if os.path.exists(store):
         shutil.rmtree(store)   # stale/failed build; real_pairs.npz untouched
     zarr.open(store, mode='w', shape=(total, BANK_PX, BANK_PX, 3),
@@ -635,7 +670,7 @@ def build_bank():
         for fut in tqdm(as_completed(futs), total=len(futs), desc='crop'):
             done += fut.result()
     assert done == total
-    np.savez(os.path.join(bank_dir, 'meta.npz'),
+    np.savez(os.path.join(bdir, 'meta.npz'),
              area=np.array(area_of, np.int32),
              node=np.array(node_of, np.int32),
              centers=np.array(centers, np.int32),
@@ -700,9 +735,8 @@ class TemporalBankDataset(Dataset):
         self.trans_std = t.translationErrorStd_px
         self.corner_std = t.homographyCornerErrorStd_px
         self.scale_std = t.scaleStd
-        self.patches = zarr.open(os.path.join(cfg.data.path.patch_bank,
-                                              'bank.zarr'), mode='r')
-        meta = np.load(os.path.join(cfg.data.path.patch_bank, 'meta.npz'),
+        self.patches = zarr.open(os.path.join(bank_dir(), 'bank.zarr'), mode='r')
+        meta = np.load(os.path.join(bank_dir(), 'meta.npz'),
                        allow_pickle=True)
         sel = np.where(meta['split'] == mode)[0]
         # group bank patches of one location (area, node) across layers
@@ -791,7 +825,7 @@ class FinetuneDataset(Dataset):
         self.mode = mode
         self.p_real = cfg.finetune.p_real if p_real is None else p_real
         self.sim = TemporalBankDataset('train' if mode == 'train' else 'val')
-        d = np.load(os.path.join(cfg.data.path.patch_bank, 'real_pairs.npz'))
+        d = np.load(os.path.join(bank_dir(), 'real_pairs.npz'))
         self.patches = d['patches']
         self.px, self.py = d['px'], d['py']
         self.rot, self.cov = d['rot'], d['cov']
@@ -921,6 +955,19 @@ def build_real_pairs():
                 n_alt += 1
                 continue
             patch = cv2.cvtColor(cv2.imread(f), cv2.COLOR_BGR2RGB)
+            # Debug patches were saved by MCL at ITS PATCH_PX (96 on the
+            # deployed build). Conform to the active training dimension so
+            # the label model and stored real pairs get a consistent input;
+            # UPSCALING adds no information — re-fly at the new size for
+            # genuinely higher-resolution real pairs.
+            if patch.shape[0] != PATCH_PX or patch.shape[1] != PATCH_PX:
+                print(f'  [{fl.name}] k={k}: resize debug patch '
+                      f'{patch.shape[0]}x{patch.shape[1]} -> {PATCH_PX} '
+                      f'(upscale if larger; prefer fresh flights)')
+                interp = (cv2.INTER_AREA if patch.shape[0] > PATCH_PX
+                          else cv2.INTER_CUBIC)
+                patch = cv2.resize(patch, (PATCH_PX, PATCH_PX),
+                                   interpolation=interp)
             px, py = truth_px[row]
             src_dim = cov_all[row] / gsd
             tp = extract_all(map_rgb, px, py, src_dim, angles)
@@ -939,7 +986,7 @@ def build_real_pairs():
                          float(cov_all[row])))
         print(f'[{fl.name}] {len(files)} debug frames: '
               f'{n_alt} below alt_min_m={alt_min} (takeoff/landing) skipped')
-    np.savez(os.path.join(cfg.data.path.patch_bank, 'real_pairs.npz'),
+    np.savez(os.path.join(bank_dir(), 'real_pairs.npz'),
              flight=np.array([r[0] for r in keep]),
              k=np.array([r[1] for r in keep]),
              patches=np.stack([r[2] for r in keep]),
@@ -949,7 +996,7 @@ def build_real_pairs():
              label_score=np.array([r[6] for r in keep], np.float32),
              cov=np.array([r[7] for r in keep], np.float32))
     print(f'real pairs: {len(keep)} kept '
-          f'-> {os.path.join(cfg.data.path.patch_bank, "real_pairs.npz")}')
+          f'-> {os.path.join(bank_dir(), "real_pairs.npz")}')
 
 
 # ------------------------------------------------------------------ train
@@ -1016,7 +1063,44 @@ def main(args):
     device = torch.device(cfg.device)
     print("device={}".format(device))
 
+    # Report the ACTUAL training-data patch size: the network input PATCH_PX
+    # plus the stored bank crop (BANK_PX) read from the bank's own metadata,
+    # so a size/config/bank mismatch is visible before training starts.
+    import json as _json
+    zmeta = os.path.join(bank_dir(), 'bank.zarr', '.zarray')
+    print(f'[size] network input PATCH_PX={PATCH_PX}x{PATCH_PX}, '
+          f'stored bank crop BANK_PX={BANK_PX}x{BANK_PX} '
+          f'(expect ceil({PATCH_PX}*sqrt2)={_bank_px_for(PATCH_PX)})')
+    print(f'[size] bank dir: {bank_dir()}')
+    if os.path.exists(zmeta):
+        with open(zmeta) as f:
+            zs = _json.load(f)
+        bank_actual = zs['shape'][1]
+        n_rows = zs['shape'][0]
+        print(f'[size] bank.zarr on disk: {n_rows} crops of '
+              f'{bank_actual}x{bank_actual}x3')
+        if bank_actual != BANK_PX:
+            print(f'[size] WARNING: bank was built at {bank_actual}px but '
+                  f'PATCH_PX={PATCH_PX} needs {BANK_PX}px — rebuild the bank '
+                  f'(--build-bank) or pass the matching --dimension.')
+    else:
+        print('[size] WARNING: bank.zarr not found — build it first '
+              '(--build-bank).')
+
     trainingdataset, testingdatasets = getTrainingAndTestingDatasets(finetune)
+
+    # Print the patch size of the ACTUAL training data: draw one sample and
+    # report the emitted tensor shape. Config/bank metadata alone cannot
+    # expose a mismatch introduced inside the dataset/cropping path.
+    _anc0, _pos0, _neg0 = trainingdataset[0]
+    _data_px = int(_anc0.shape[-1])
+    print(f'[size] training data sample: anchor={tuple(_anc0.shape)}, '
+          f'positive={tuple(_pos0.shape)}, negative={tuple(_neg0.shape)} '
+          f'-> patch size {_data_px}x{_data_px} px')
+    if _data_px != PATCH_PX:
+        print(f'[size] WARNING: training-data patch is {_data_px}px but '
+              f'PATCH_PX={PATCH_PX} — dataset output and network input disagree.')
+
     trainingloader = DataLoader(trainingdataset,
                                 batch_size=tcfg.batchsize, shuffle=True,
                                 num_workers=tcfg.num_workers,
@@ -1178,7 +1262,24 @@ if __name__ == '__main__':
                     help='debug: truncate each epoch')
     ap.add_argument('--experiment-name', default='',
                     help='override the configured experiment name')
+    ap.add_argument('--dimension', type=int, default=0,
+                    help='override sampledimensions.dimension_px (network '
+                         'input px): 96 (reference), 128/160 (resolution '
+                         'trial), 256. Requires a bank built at the matching '
+                         'BANK_PX and a retrained checkpoint.')
     args = ap.parse_args()
+
+    if args.dimension and args.dimension != PATCH_PX:
+        # Reassign module globals: all build/dataset/score code reads these
+        # at call time, so this retargets the whole process without reimport.
+        globals()['PATCH_PX'] = args.dimension
+        globals()['BANK_PX'] = _bank_px_for(args.dimension)
+        globals()['BANK_CHUNK'] = (1, BANK_PX, BANK_PX, 3)
+        print(f'[dimension override] PATCH_PX={PATCH_PX} BANK_PX={BANK_PX} '
+              f'(config had {cfg.sampledimensions.dimension_px})')
+        print(f'[dimension override] bank dir = {bank_dir()}  '
+              f'(separate per-size; est. disk ~{49 * (BANK_PX / 136) ** 2:.0f}'
+              f' GB vs 49 GB at 96)')
 
     if args.build_bank:
         build_bank()
