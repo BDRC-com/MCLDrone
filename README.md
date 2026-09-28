@@ -729,6 +729,7 @@ for i in $(seq 1 15); do pgrep -f 'ros2 bag record' >/dev/null || break; sleep 1
 pkill -f run_subscribe_msckf
 pkill -INT -f fcu_pose_bridge.py; sleep 1
 pkill -INT -f MicroXRCEAgent
+pkill -INT -f 'ros2 launch cyperstereo_ros2_bridge'
 
 # 4. 验证数据包
 ros2 bag info ~/ros2bag/${NAME}_data/*_0.mcap | \
@@ -746,6 +747,7 @@ pkill -INT -f 'ros2 bag record'
 pkill -f run_subscribe_msckf
 pkill -INT -f fcu_pose_bridge.py
 pkill -INT -f MicroXRCEAgent
+pkill -INT -f 'ros2 launch cyperstereo_ros2_bridge'
 ss -ulnp | grep 8888 # 需要为空
 ```
 
