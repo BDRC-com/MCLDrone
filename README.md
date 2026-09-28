@@ -576,15 +576,17 @@ tail -f ~/ros2bag/${NAME}_flightlog/camera_bridge.log
 仅观察MCLDrone的Odometry：
 
 ```bash
-~/MCLDrone/run_live.sh --name flight01 --daemon \ # --name 可以是任何你想要的名字
+ # --name 可以是任何你想要的名字
+~/MCLDrone/run_live.sh --name $NAME --daemon \
   --map ~/MCLDrone/maps/z17_5120.png \
-  --lat 22.842897 --lon 114.525573 # 起飞点的经纬度
+  --lat 22.842897 --lon 114.525573
+   # --lat --lon 起飞点的经纬度
 ```
 
 将MCLDrone的Odometry推送给EV，在QGC中设定好计划，保存为`*.plan`：
 
 ```bash
-~/MCLDrone/run_live.sh --name gpstest01 --daemon \
+~/MCLDrone/run_live.sh --name $NAME --daemon \
   --map ~/MCLDrone/maps/z17_5120.png --lat 22.842897 --lon 114.525573 \
   --manager --qgc-plan path/to/*.plan --cruise-alt 50 --v-max 10
 ```
@@ -592,15 +594,15 @@ tail -f ~/ros2bag/${NAME}_flightlog/camera_bridge.log
 #### 2-1-2. 重新连接后检查
 
 ```bash
-~/MCLDrone/run_live.sh --name flight01 --status
+~/MCLDrone/run_live.sh --name $NAME --status
 # Or
-tail -f ~/ros2bag/flight01_flightlog/console.log
+tail -f ~/ros2bag/${NAME}_flightlog/console.log
 ```
 
 #### 2-1-3. 结束录制
 
 ```bash
-~/MCLDrone/run_live.sh --name flight01 --stop
+~/MCLDrone/run_live.sh --name $NAME --stop
 ```
 
 #### 2-1-4. 关闭摄像机
