@@ -588,7 +588,8 @@ tail -f ~/ros2bag/${NAME}_flightlog/camera_bridge.log
 ```bash
 ~/MCLDrone/run_live.sh --name $NAME --daemon \
   --map ~/MCLDrone/maps/z17_5120.png --lat 22.842897 --lon 114.525573 \
-  --manager --qgc-plan path/to/*.plan --cruise-alt 50 --v-max 10
+  --manager --qgc-plan path/to/*.plan --cruise-alt 120.0 --v-max 10.0
+  # cruise-alt 120.0 为巡航高度，v-max 10.0 为最大速度
 ```
 
 #### 2-1-2. 重新连接后检查
