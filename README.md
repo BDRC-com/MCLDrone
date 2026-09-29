@@ -554,10 +554,14 @@ source ~/MCLDrone/ovws/install/setup.zsh
 source ~/my_px4/install/setup.zsh
 NAME=flight01 # 你可以选择任何你想要的名字
 mkdir -p ~/ros2bag/mcl_runs ~/ros2bag/${NAME}_flightlog
-nohup ~/start_camera.sh > ~/ros2bag/${NAME}_flightlog/camera_bridge.log 2>&1 & disown
+nohup ~/start_camera.sh > ~/ros2bag/camera_bridge_${Y%m%d%H%M%S}.log 2>&1 & disown
 ros2 topic hz /imu0 # 检查IMU话题频率
-tail -f ~/ros2bag/${NAME}_flightlog/camera_bridge.log
+tail -f ~/ros2bag/camera_bridge_${Y%m%d%H%M%S}.log # 查看摄像机日志
 ```
+**注意：**
+- 确保摄像机已连接并启动成功，否则会导致数据丢失。
+- 每次执行一个新的飞行之前，都要重新设置`$NAME`并运行`mkdir -p ~/ros2bag/mcl_runs ~/ros2bag/${NAME}_flightlog`，否则会导致数据覆盖。
+
 
 ## 2. 启动MCLDrone
 
@@ -576,7 +580,6 @@ tail -f ~/ros2bag/${NAME}_flightlog/camera_bridge.log
 仅观察MCLDrone的Odometry：
 
 ```bash
- # --name 可以是任何你想要的名字
 ~/MCLDrone/run_live.sh --name $NAME --daemon \
   --map ~/MCLDrone/maps/z17_5120.png \
   --lat 22.842897 --lon 114.525573
