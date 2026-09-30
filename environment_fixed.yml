@@ -1,0 +1,44 @@
+# Reproducible TRAINING / offline-analysis environment (x86_64 dev machines)
+#
+# Covers: train_similarity.py (--build-bank/--pretrain/--build-real/
+# --finetune), eval_real_patches.py, bag_mcl.py replay analysis, zarr patch
+# bank tooling. It does NOT and CANNOT run the ROS nodes (mcl_node,
+# fcu_pose_bridge, mission_manager) — those need the distro rclpy Python;
+# see MCLDrone/SETUP_ENV.md.
+#
+# Create:
+#   conda env create -f environment_fixed.yml
+#   conda activate sivl
+# Verify:
+#   python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+#   # -> 2.8.0+cu128 True (outside any sandbox; needs /dev/nvidia* access)
+#
+# Pinned to the env that produced huizhou_ft_mt_1_epoch_040_of_40.pt
+# (verified 2026-09-23). pip section frozen; conda side version pins were
+# relaxed so the file resolves on current conda-forge repodata.
+name: sivl
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.9
+  - numpy<2                # MUST stay <2 (numcodecs 0.12 / compiled ext ABI)
+  - scipy
+  - pandas
+  - matplotlib
+  - pillow
+  - pyyaml
+  - tqdm
+  - dask
+  - imageio
+  - imageio-ffmpeg
+  - scikit-image
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu128
+      - torch==2.8.0
+      - torchvision==0.23.0
+      - "opencv-python-headless>=4.8,<4.11"   # 4.5.2 与 numpy 1.26 不兼容(gapi循环导入)；4.8+ 兼容, SIFT_create API 不变
+      - albumentations==1.0.0
+      - zarr==2.18.2                        # MUST be 2.x (v2 DirectoryStore API)
+      - numcodecs==0.12.1                  # Blosc zstd chunk codec for the bank
+      - pyulog==1.2.4                      # ULog GPS-truth parsing
