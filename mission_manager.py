@@ -185,7 +185,11 @@ def parse_qgc_plan(path, zoom, gsd, cx_px, cy_px, off_x, off_y, cruise_alt,
     for it in items:
         cmd = int(it.get('command', 0))
         frame = int(it.get('frame', 3))
-        p = it.get('params', [0] * 7)
+        # QGC writes params as a (possibly short) numeric list — pad to the
+        # canonical 7 floats + lat/lon/alt (indices 5/6/7) so plans with
+        # e.g. a CONDITION item carrying only 2 params cannot IndexError.
+        p = it.get('params') or []
+        p = (list(p) + [0.0] * 8)[:8]
         if cmd == _DO_CHANGE_SPEED:
             # p2 = speed m/s (0 restores default); ignore throttle(0)/alt(1)
             speed = default_speed if float(p[2]) <= 0.0 else float(p[2])

@@ -857,6 +857,15 @@ class MclNode(Node):
         self.fcu_alt_recv = -1.0          # wall-clock time of last live sample
         self.fcu_att_seen = False         # live orientation valid, logged once
         self.fcu_alt_warned = False       # stamped-clock mismatch logged once
+        # FCU-header-stamp <-> camera-clock recovery (MAVROS timesync off:
+        # the pose stamps live on another clock than the camera bridge, so
+        # direct stamp matching misses and heading/tilt silently dropped to
+        # None — flight09 init consequently fell back to a FULL-CIRCLE yaw
+        # sweep and seeded on a rotated 0.99 lookalike).
+        self.fcu_alt_wall = deque(maxlen=3000)  # wall receipt per FCU sample
+        self.img_recent = deque(maxlen=8)       # (wall_recv, hdr stamp) imgs
+        self.fcu_off_ema = None                 # EMA: fcu_stamp - cam_stamp
+        self.fcu_off_warned = False             # offset-match logged once
         # Concurrency (the 200 Hz fusion): process_one runs the CNN (~0.9 s
         # per frame on the Jetson) inside the DEFAULT callback group. On a
         # single-threaded executor that starved on_odom and on_fcu_alt for
@@ -1187,10 +1196,28 @@ class MclNode(Node):
         as the replay path's -vehicle_local_position.z; orientation = EKF
         attitude of base_link in the ENU world)."""
         t = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        wnow = time.time()
         if not self.fcu_alt_t:
             self.get_logger().info('MAVROS FCU altitude active (live baro)')
         with self.buf_lock:          # live_fcu_* readers run in process_one
+            # Recover fcu_stamp - cam_stamp at this wall instant: interpolate
+            # the camera clock from the two newest image receipts (both
+            # streams run ~real-time). Lets stamp-matched heading/tilt/vel
+            # keep working with no MAVROS timesync configured.
+            if len(self.img_recent) >= 2:
+                (w0, t0), (w1, t1) = self.img_recent[-2], self.img_recent[-1]
+                dw = w1 - w0
+                # camera callbacks keep arriving during CNN blocks, so the
+                # newest image is normally <=40 ms old; reject long
+                # extrapolations (a stale camera clock poisons the offset)
+                if dw > 1e-3 and 0.0 <= wnow - w1 < 0.5:
+                    cam_now = t1 + (wnow - w1) * (t1 - t0) / dw
+                    off = t - cam_now
+                    self.fcu_off_ema = (
+                        off if self.fcu_off_ema is None
+                        else 0.9 * self.fcu_off_ema + 0.1 * off)
             self.fcu_alt_t.append(t)
+            self.fcu_alt_wall.append(wnow)
             self.fcu_alt_z.append(float(msg.pose.position.z))
             self.fcu_px.append(float(msg.pose.position.x))
             self.fcu_py.append(float(msg.pose.position.y))
@@ -1215,36 +1242,88 @@ class MclNode(Node):
                 self.fcu_roll.append(float('nan'))
                 self.fcu_pitch.append(float('nan'))
                 self.fcu_hdg_vals.append(float('nan'))
-        self.fcu_alt_recv = time.time()
+        self.fcu_alt_recv = wnow
+
+    def _fcu_bracket(self, ts, t, max_age):
+        """(lo, hi, f) of FCU samples bracketing image time t within max_age,
+        else None. Tries raw header stamps first; if they miss, retries with
+        the recovered FCU<->camera clock offset (logs once when used)."""
+        import bisect
+
+        def bracket(tt):
+            i = bisect.bisect_left(ts, tt)
+            lo, hi = max(0, i - 1), min(len(ts) - 1, i)
+            if min(abs(ts[lo] - tt), abs(ts[hi] - tt)) > max_age:
+                return None
+            if ts[hi] == ts[lo]:
+                return lo, lo, 0.0
+            f = min(max((tt - ts[lo]) / (ts[hi] - ts[lo]), 0.0), 1.0)
+            return lo, hi, f
+
+        m = bracket(t)
+        if m is not None:
+            return m
+        if self.fcu_off_ema is not None and abs(self.fcu_off_ema) > 1e-6:
+            m = bracket(t + self.fcu_off_ema)
+            if m is not None:
+                if not self.fcu_off_warned:
+                    self.fcu_off_warned = True
+                    self.get_logger().warn(
+                        f'FCU stamps differ from the camera clock by '
+                        f'{self.fcu_off_ema:+.2f} s (no MAVROS timesync) — '
+                        f'matching altitude/tilt/heading via recovered offset')
+                return m
+        return None
+
+    def _fcu_nearest(self, ts, t, max_age):
+        """Index of the FCU sample nearest image time t within max_age, with
+        the same raw-then-offset retry as _fcu_bracket, else None."""
+        import bisect
+        off = self.fcu_off_ema if (
+            self.fcu_off_ema is not None
+            and abs(self.fcu_off_ema) > 1e-6) else 0.0
+        for tt in ((t,) if off == 0.0 else (t, t + off)):
+            i = bisect.bisect_left(ts, tt)
+            best = None
+            for j in (i - 1, i):
+                if 0 <= j < len(ts) and (best is None
+                                         or abs(ts[j] - tt) < abs(ts[best] - tt)):
+                    best = j
+            if best is not None and abs(ts[best] - tt) <= max_age:
+                if off != 0.0 and tt != t and not self.fcu_off_warned:
+                    self.fcu_off_warned = True
+                    self.get_logger().warn(
+                        f'FCU stamps differ from the camera clock by '
+                        f'{self.fcu_off_ema:+.2f} s (no MAVROS timesync) — '
+                        f'matching altitude/tilt/heading via recovered offset')
+                return best
+        return None
 
     def live_fcu_alt(self, t):
         """Height at image time t from the live MAVROS deque, or None.
 
         Matches on header stamps first (correct when MAVROS timesync is
-        configured). If the stamps never line up with the camera clock but
-        fresh data IS arriving, falls back to the newest sample — the baro
-        changes slowly, so ~1 s staleness is harmless for the ortho scale
-        (and strictly better than the VIO-z fallback)."""
+        configured), then via the recovered FCU<->camera clock offset. If
+        the stamps never line up but fresh data IS arriving, falls back to
+        the newest sample — the baro changes slowly, so ~1 s staleness is
+        harmless for the ortho scale (and strictly better than the VIO-z
+        fallback)."""
         with self.buf_lock:         # on_fcu_alt appends on its own thread
             if not self.fcu_alt_t:
                 return None
             ts = list(self.fcu_alt_t)
             zs = list(self.fcu_alt_z)
-            import bisect
-            i = bisect.bisect_left(ts, t)
-            lo, hi = max(0, i - 1), min(len(ts) - 1, i)
-            near = min(abs(ts[lo] - t), abs(ts[hi] - t))
-            if near <= FCU_ALT_MAX_AGE:
-                if ts[hi] == ts[lo]:
-                    return zs[lo]
-                f = min(max((t - ts[lo]) / (ts[hi] - ts[lo]), 0.0), 1.0)
+            m = self._fcu_bracket(ts, t, FCU_ALT_MAX_AGE)
+            if m is not None:
+                lo, hi, f = m
                 return zs[lo] * (1.0 - f) + zs[hi] * f
             if time.time() - self.fcu_alt_recv < 2.0:
                 if not self.fcu_alt_warned:
                     self.fcu_alt_warned = True
                     self.get_logger().warn(
                         'FCU altitude stamps do not match the camera clock '
-                        '(MAVROS timesync off?) — using newest sample')
+                        'and offset recovery is unavailable — using newest '
+                        'sample')
                 return zs[-1]
             return None
 
@@ -1262,26 +1341,23 @@ class MclNode(Node):
     def live_fcu_tilt(self, t):
         """(roll, pitch) at image time t from the live MAVROS deque, or None.
 
-        Stamp-matched bisect + linear interpolation within FCU_ATT_MAX_AGE.
-        No fresh-sample fallback (unlike the altitude): tilt changes fast
-        during turns, and a wrong tilt is worse than falling back to the
-        VIO attitude — on stamp mismatch the caller uses VIO instead."""
+        Stamp-matched bisect + linear interpolation within FCU_ATT_MAX_AGE,
+        using the recovered FCU<->camera clock offset when timesync is off.
+        No blind newest-sample fallback: tilt changes fast during turns, and
+        a wrong tilt is worse than falling back to the VIO attitude — on a
+        failed match the caller uses VIO instead."""
         with self.buf_lock:         # on_fcu_alt appends on its own thread
             if not self.fcu_att_seen or not self.fcu_alt_t:
                 return None
             ts = list(self.fcu_alt_t)
             rs = list(self.fcu_roll)
             ps = list(self.fcu_pitch)
-            import bisect
-            i = bisect.bisect_left(ts, t)
-            lo, hi = max(0, i - 1), min(len(ts) - 1, i)
-            near = min(abs(ts[lo] - t), abs(ts[hi] - t))
-            if near > FCU_ATT_MAX_AGE or not (np.isfinite(rs[lo]) and
-                                              np.isfinite(rs[hi])):
+            m = self._fcu_bracket(ts, t, FCU_ATT_MAX_AGE)
+            if m is None:
                 return None
-            if ts[hi] == ts[lo]:
-                return rs[lo], ps[lo]
-            f = min(max((t - ts[lo]) / (ts[hi] - ts[lo]), 0.0), 1.0)
+            lo, hi, f = m
+            if not (np.isfinite(rs[lo]) and np.isfinite(rs[hi])):
+                return None
             return (rs[lo] * (1.0 - f) + rs[hi] * f,
                     ps[lo] * (1.0 - f) + ps[hi] * f)
 
@@ -1296,23 +1372,21 @@ class MclNode(Node):
 
     def live_fcu_hdg(self, t):
         """NED heading (rad, unwrapped) at image time t from the live MAVROS
-        deque, or None. Same stamp-matched interpolation as the tilt; no
-        fresh-sample fallback (a wrong heading mis-steers every scan)."""
+        deque, or None. Stamp-matched interpolation like the tilt, including
+        the recovered FCU<->camera clock offset; no blind newest-sample
+        fallback (a wrong heading mis-steers every scan — None makes the
+        scans use their full-circle yaw fallback instead)."""
         with self.buf_lock:         # on_fcu_alt appends on its own thread
             if not self.fcu_att_seen or not self.fcu_alt_t:
                 return None
             ts = list(self.fcu_alt_t)
             hs = list(self.fcu_hdg_vals)
-            import bisect
-            i = bisect.bisect_left(ts, t)
-            lo, hi = max(0, i - 1), min(len(ts) - 1, i)
-            near = min(abs(ts[lo] - t), abs(ts[hi] - t))
-            if near > FCU_ATT_MAX_AGE or not (np.isfinite(hs[lo])
-                                              and np.isfinite(hs[hi])):
+            m = self._fcu_bracket(ts, t, FCU_ATT_MAX_AGE)
+            if m is None:
                 return None
-            if ts[hi] == ts[lo]:
-                return hs[lo]
-            f = min(max((t - ts[lo]) / (ts[hi] - ts[lo]), 0.0), 1.0)
+            lo, hi, f = m
+            if not (np.isfinite(hs[lo]) and np.isfinite(hs[hi])):
+                return None
             return hs[lo] * (1.0 - f) + hs[hi] * f
 
     def hdg_at(self, t):
@@ -1327,7 +1401,7 @@ class MclNode(Node):
     def live_fcu_vel(self, t):
         """(v_east, v_north) m/s at time t from the live MAVROS ENU position
         deque, or None: finite difference between the sample nearest t
-        (within 0.5 s — no silent clamping) and the oldest sample 0.8-2.5 s
+        (within 0.5 s — no silent clamping) and the oldest sample ~0.8-2.5 s
         before it. The MAVROS ENU frame IS the MCL map frame (x = East,
         y = North), so no rotation is needed; the >= 0.8 s baseline rides
         over the single-sample jitter. No fresh-sample fallback (the DR
@@ -1338,18 +1412,19 @@ class MclNode(Node):
             ts = list(self.fcu_alt_t)
             xs = list(self.fcu_px)
             ys = list(self.fcu_py)
-            import bisect
-            i = bisect.bisect_left(ts, t)
-            lo, hi = max(0, i - 1), min(len(ts) - 1, i)
-            if abs(ts[lo] - t) <= abs(ts[hi] - t):
-                hi = lo
-            if abs(ts[hi] - t) > 0.5:
+            hi = self._fcu_nearest(ts, t, 0.5)
+            if hi is None:
                 return None
             j = hi
-            while j > 0 and ts[hi] - ts[j - 1] < 0.8:
+            # include older samples while the span stays <= the target:
+            # strict '<' stopped one sample early on the regular 50 Hz grid
+            # (span 0.78 s) and the dt < 0.8 gate below then rejected EVERY
+            # lookup — the live DR velocity gate was silently dead.
+            while j > 0 and ts[hi] - ts[j - 1] <= 0.8:
                 j -= 1
             dt = ts[hi] - ts[j]
-            if dt < 0.8 or dt > 2.5:
+            # one-sample tolerance at 50 Hz: jittered grids land at 0.78-0.82
+            if dt < 0.75 or dt > 2.5:
                 return None
             return ((xs[hi] - xs[j]) / dt, (ys[hi] - ys[j]) / dt)
 
@@ -1457,6 +1532,10 @@ class MclNode(Node):
                 f'unsupported encoding {msg.encoding!r} (need mono8)')
             return
         t = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        # wall receipt paired with the header stamp — feeds the FCU<->camera
+        # clock-offset recovery (every delivered frame, before stride gating)
+        with self.buf_lock:
+            self.img_recent.append((time.time(), t))
         img = np.frombuffer(msg.data, dtype=np.uint8)
         img = img.reshape(msg.height, msg.step)[:, :msg.width].copy()
         in_range = (self.frame_start <= 0 or self.frame_idx >= self.frame_start) \
@@ -1852,8 +1931,15 @@ class MclNode(Node):
                 # compass-steered yaw window when available, else full circle
                 if yaw_pred is not None:
                     yaw0, span = yaw_pred, 2.0 * STEER_SPAN
+                    self.get_logger().info(
+                        f'point init: compass-steered yaw window '
+                        f'{np.degrees(yaw0):.0f}+-{np.degrees(STEER_SPAN):.0f}'
+                        f' deg (FCU heading active)')
                 else:
                     yaw0, span = None, 2.0 * np.pi
+                    self.get_logger().warn(
+                        'point init: NO FCU heading matched — full-circle '
+                        'yaw sweep (check FCU timesync/clock offset)')
                 peaks = local_yaw_scan(
                     self.mcl, patch, x0_m, y0_m, radius_m=r, step_m=step,
                     yaw_steps=12, topk=5, yaw0=yaw0, yaw_span=span)
