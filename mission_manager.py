@@ -185,18 +185,22 @@ def parse_qgc_plan(path, zoom, gsd, cx_px, cy_px, off_x, off_y, cruise_alt,
     for it in items:
         cmd = int(it.get('command', 0))
         frame = int(it.get('frame', 3))
-        # QGC writes params as a (possibly short) numeric list — pad to the
-        # canonical 7 floats + lat/lon/alt (indices 5/6/7) so plans with
-        # e.g. a CONDITION item carrying only 2 params cannot IndexError.
-        p = it.get('params') or []
-        p = (list(p) + [0.0] * 8)[:8]
+        # QGC .plan stores params as exactly 7 entries:
+        # [param1, param2, param3, param4, lat(x), lon(y), alt(z)] — the
+        # geo coordinates are indices 4/5/6, NOT 5/6/7 (the old indexing
+        # read lon/lat as (lon, alt) -> waypoints landed thousands of km
+        # away and p[7] IndexError'd on the real 7-element lists).
+        # CONDITION items may carry fewer entries / None values.
+        raw = it.get('params') or []
+        p = [(0.0 if x is None else float(x)) for x in raw]
+        p = (p + [0.0] * 7)[:7]
         if cmd == _DO_CHANGE_SPEED:
             # p2 = speed m/s (0 restores default); ignore throttle(0)/alt(1)
-            speed = default_speed if float(p[2]) <= 0.0 else float(p[2])
+            speed = default_speed if p[2] <= 0.0 else p[2]
             continue
         if cmd not in (_NAV_TAKEOFF, _NAV_WAYPOINT, _NAV_LAND):
             continue
-        lat, lon, alt = float(p[5]), float(p[6]), float(p[7])
+        lat, lon, alt = p[4], p[5], p[6]
         if frame == _MAV_FRAME_GLOBAL:
             alt = alt - home_amsl             # AMSL -> above home
         # frame 3 (relative home) and 10 (AGL): use as metres already
@@ -214,7 +218,7 @@ def parse_qgc_plan(path, zoom, gsd, cx_px, cy_px, off_x, off_y, cruise_alt,
                          'the local origin')
     if not wps:
         raise SystemExit('QGC plan contains no NAV_WAYPOINT items')
-    return origin, wps
+    return origin, wps, home_amsl
 
 
 class MissionManager(Node):
@@ -246,8 +250,9 @@ class MissionManager(Node):
         wps_xy = parse_waypoints(param('waypoints', ''))
 
         self.waypoints = []             # normalized (east, north, alt, speed)
+        home_amsl = 0.0
         if qgc_plan_path:
-            (ox, oy), qwps = parse_qgc_plan(
+            (ox, oy), qwps, home_amsl = parse_qgc_plan(
                 qgc_plan_path, map_zoom, map_gsd, map_cx, map_cy,
                 map_off_x, map_off_y, cruise, self.v_max)
             # QGC plan's own home overrides an explicit local origin so the
@@ -298,6 +303,15 @@ class MissionManager(Node):
         self.set_global_origin = bool(param('set_global_origin', True))
         self.map_center_lat = float(param('map_center_lat', 22.8445297))
         self.map_center_lon = float(param('map_center_lon', 114.5242310))
+        # Origin altitude AMSL [m] — MUST accompany SET_GPS_GLOBAL_ORIGIN:
+        # param7=0 puts the EKF local frame at MSL 0, which read +44 m at
+        # this ~44 m AMSL site while on the ground (flight10-12: phantom
+        # altitude -> MCL false locks on the ground + shifted climb).
+        # Defaults to the QGC plan home altitude; override via parameter.
+        self.origin_alt = float(param('origin_alt', home_amsl))
+        # Safety-pilot takeover: once armed, a manual RC mode lasting longer
+        # than this disengages the manager completely (no OFFBOARD fight)
+        self.rc_override_s = float(param('rc_override_s', 1.0))
         self.ff_altitude_hold = bool(param('ff_altitude_hold', True))
         # Sim rehearsal only: the bag's body-twist z carries real-flight tilt
         # coupling (~1.6 m/s) which the sim airframe does not have -> the EV
@@ -311,6 +325,10 @@ class MissionManager(Node):
         self.status_t = 0.0
         self.lpos = None
         self.landed = False
+        self.ever_armed = False        # saw ARMED at least once (RC override)
+        self.manual_since = None       # first tick armed+manual (RC takeover)
+        self.takeover = False          # manager disengaged, RC owns the craft
+        self.alt_warn_t = 0.0          # ground-altitude sanity throttle
         self.health = None
         self.health_t = 0.0
         self.ev = None                 # last /mcl/odom
@@ -545,11 +563,35 @@ class MissionManager(Node):
         if self.health is not None and now - self.health_t > 5.0:
             self.health = None                # health channel stalled -> EV only
 
+        armed = self.status.arming_state == ARMING_STATE_ARMED
+        self.ever_armed = self.ever_armed or armed
+        # --- SAFETY PILOT TAKEOVER ----------------------------------------
+        # Once armed, any mode that is not OFFBOARD (ours) or AUTO.LAND (the
+        # guard's own termination) means the RC/GCS took control. Disengage
+        # COMPLETELY after a short debounce: no setpoints, no mode commands,
+        # no fighting the stick (flight10: the manager forced the drone back
+        # into OFFBOARD 8 s after the pilot switched out).
+        if self.ever_armed and self.status.nav_state not in (
+                NAV_STATE_OFFBOARD, NAV_STATE_AUTO_LAND):
+            if self.manual_since is None:
+                self.manual_since = now
+            elif now - self.manual_since > self.rc_override_s and not self.takeover:
+                self.takeover = True
+                self.get_logger().error(
+                    'pilot/GCS took control (nav_state=%d) — mission '
+                    'manager DISENGAGED (setpoints stopped); RC owns the '
+                    'vehicle' % self.status.nav_state)
+            if self.takeover:
+                return
+        else:
+            self.manual_since = None
+
         # EKF2 global origin = map centre (repeat during the first seconds)
         if (self.set_global_origin and self.origin_count < 6
                 and now - self.last_origin_t > 2.0):
             self.send_command(CMD_SET_GPS_GLOBAL_ORIGIN,
-                              p5=self.map_center_lat, p6=self.map_center_lon)
+                              p5=self.map_center_lat, p6=self.map_center_lon,
+                              p7=self.origin_alt)
             self.last_origin_t = now
             self.origin_count += 1
 
@@ -562,8 +604,22 @@ class MissionManager(Node):
         ev_age = None if self.ev_t is None else now - self.ev_t
         ready = (self.status.nav_state == NAV_STATE_OFFBOARD
                  and self.status.arming_state == ARMING_STATE_ARMED)
+        # Pre-flight ground altitude sanity: on the ground the FCU frame must
+        # read within ~20 m of zero. A bad local origin (SET_GPS_GLOBAL_ORIGIN
+        # with wrong/missing altitude: flight10-12 read +44 m parked) makes
+        # MCL orthoproject ground patches at "45 m" and false-lock before
+        # takeoff — never arm in that state.
+        alt_now = self.alt()
+        ground_alt_bad = (not armed and self.landed and alt_now is not None
+                          and abs(alt_now) > 20.0)
+        if ground_alt_bad and now - self.alt_warn_t > 2.0:
+            self.alt_warn_t = now
+            self.get_logger().error(
+                'preflight BLOCKED: FCU altitude reads %.1f m while landed '
+                '(expected within +-20 m of 0) — check EKF local origin / '
+                'origin_alt; NOT arming' % alt_now)
         st = self.guard.update(now, ready, self.health, ev_age,
-                               self.ev_map_pos, self.alt(),
+                               self.ev_map_pos, alt_now,
                                self.mission_done(now, ev_age), self.landed)
         if st != self.last_state:
             self.get_logger().info('guard: %s -> %s (%s)'
@@ -602,22 +658,20 @@ class MissionManager(Node):
         self.sp_pub.publish(sp)
 
         # --- commands ----------------------------------------------------
-        # Keep the vehicle in OFFBOARD for the WHOLE mission: a PX4 failsafe
-        # (RTL/land) drops out of OFFBOARD, and with the mode command only in
-        # the preflight states the manager would keep commanding a vehicle
-        # that no longer listens. ARM stays pre-takeoff only — a disarm later
-        # means PX4 landed, which the guard's LAND -> DONE path handles.
-        # NB: never gate this on the PX4 land detector — it is True while the
-        # vehicle sits on the ground before takeoff (self.landed only feeds
-        # the guard).
-        if st in (WAIT, TAKEOFF, MISSION, HOLD, RETURN):
+        # OFFBOARD is entered ONCE during preflight (WAIT): the 2 s EV
+        # precondition guarantees the setpoint stream is already flowing.
+        # After takeoff an RC mode switch belongs to the safety pilot — the
+        # takeover block above disengages us, and we never fight our way back
+        # into OFFBOARD. ARM stays pre-takeoff only, behind the ground-
+        # altitude sanity gate.
+        if st == WAIT:
             if now - self.last_cmd_t > 1.0:
                 self.last_cmd_t = now
                 if self.status.nav_state != NAV_STATE_OFFBOARD:
                     if (self.first_ev_t is not None
                             and now - self.first_ev_t > 2.0):
                         self.send_command(CMD_DO_SET_MODE, *MODE_OFFBOARD)
-                elif (st in (WAIT, TAKEOFF)
+                elif (not ground_alt_bad
                       and self.status.arming_state != ARMING_STATE_ARMED):
                     self.send_command(CMD_ARM_DISARM, p1=1.0)
         if st == LAND and now - self.last_land_t > 2.0:

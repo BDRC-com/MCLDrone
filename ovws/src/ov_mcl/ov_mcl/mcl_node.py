@@ -866,6 +866,7 @@ class MclNode(Node):
         self.img_recent = deque(maxlen=8)       # (wall_recv, hdr stamp) imgs
         self.fcu_off_ema = None                 # EMA: fcu_stamp - cam_stamp
         self.fcu_off_warned = False             # offset-match logged once
+        self.hdg_wait_start = None              # point-init heading settle wait
         # Concurrency (the 200 Hz fusion): process_one runs the CNN (~0.9 s
         # per frame on the Jetson) inside the DEFAULT callback group. On a
         # single-threaded executor that starved on_odom and on_fcu_alt for
@@ -1928,6 +1929,26 @@ class MclNode(Node):
                     + f', region radius {self.init_radius_m:.0f} m')
                 r = self.init_radius_m
                 step = max(12.0, r / 10.0)
+                # Startup race (flight10): FCU attitude IS arriving but the
+                # camera<->FCU clock offset has not converged yet, so the
+                # heading lookup fails and the scan would fall back to a
+                # full-circle yaw sweep. Wait up to 10 s for the offset
+                # before accepting that there is genuinely no compass.
+                if (not self.bag_dir and yaw_pred is None
+                        and self.fcu_att_seen
+                        and self.fcu_off_ema is None):
+                    if self.hdg_wait_start is None:
+                        self.hdg_wait_start = t
+                    if t - self.hdg_wait_start < 10.0:
+                        if k % 50 == 0:
+                            self.get_logger().info(
+                                f'k={k}: point init waiting for FCU heading '
+                                f'clock offset ({t-self.hdg_wait_start:.0f} s)')
+                        self.health.update(note='hdg_wait', k=int(k),
+                                           t=float(t), vio=vio,
+                                           coverage=round(float(coverage), 1),
+                                           alt=round(float(alt), 1))
+                        return
                 # compass-steered yaw window when available, else full circle
                 if yaw_pred is not None:
                     yaw0, span = yaw_pred, 2.0 * STEER_SPAN

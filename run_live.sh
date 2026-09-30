@@ -75,6 +75,8 @@ V_MAX="12.0"
 EV_FRAME="map"                  # map | first_fix
 MAP_CENTER_LAT="22.8445297"     # EKF2 global origin (prestage_map value)
 MAP_CENTER_LON="114.5242310"
+SET_GLOBAL_ORIGIN=0             # 1 only for GPS-DENIED stage; sends origin
+ORIGIN_ALT=""                   # AMSL m of origin (auto from QGC home if set)
 MGR_EXTRA=""
 # MANAGER_PY resolved after SCRIPT_DIR is set below.
 # Recorders are SPLIT by design: heavy image frames in one bag, high-rate
@@ -148,6 +150,9 @@ while [ $# -gt 0 ]; do
     --ev-frame)        EV_FRAME="$2"; shift 2;;
     --map-center-lat)  MAP_CENTER_LAT="$2"; shift 2;;
     --map-center-lon)  MAP_CENTER_LON="$2"; shift 2;;
+    --set-global-origin) SET_GLOBAL_ORIGIN=1; shift;;
+    --no-global-origin)  SET_GLOBAL_ORIGIN=0; shift;;
+    --origin-alt)      ORIGIN_ALT="$2"; shift 2;;
     --mgr-extra)       MGR_EXTRA="$2"; shift 2;;
     --no-agent)    START_AGENT=0; shift;;
     --no-bridge)   START_BRIDGE=0; shift;;
@@ -516,6 +521,12 @@ if [ "$START_MANAGER" = 1 ]; then
   log "starting mission_manager (mode=$MGR_MODE, EV->PX4 OFFBOARD autopilot)"
   log "  WARNING: it will ARM and switch to OFFBOARD once /mcl/odom is live"
   log "  and the guard enters TAKEOFF. Props clear; safety pilot on RC."
+  if [ "$SET_GLOBAL_ORIGIN" = 1 ]; then
+    log "  SET_GPS_GLOBAL_ORIGIN enabled (GPS-denied stage; origin_alt="\
+"${ORIGIN_ALT:-from QGC home})"
+  else
+    log "  global origin untouched (GPS-on validation stage)"
+  fi
   mgr_args=(--ros-args
     -p mission_mode:="$MGR_MODE"
     -p ev_frame:="$EV_FRAME"
@@ -529,7 +540,9 @@ if [ "$START_MANAGER" = 1 ]; then
     -p map_geo_offset_x:="$OFF_X"
     -p map_geo_offset_y:="$OFF_Y"
     -p map_center_lat:="$MAP_CENTER_LAT"
-    -p map_center_lon:="$MAP_CENTER_LON")
+    -p map_center_lon:="$MAP_CENTER_LON"
+    -p set_global_origin:="$SET_GLOBAL_ORIGIN")
+  [ -n "$ORIGIN_ALT" ]    && mgr_args+=(-p "origin_alt:=$ORIGIN_ALT")
   [ -n "$WAYPOINTS" ]    && mgr_args+=(-p "waypoints:=$WAYPOINTS")
   [ -n "$WAYPOINTS_LL" ] && mgr_args+=(-p "waypoints_ll:=$WAYPOINTS_LL")
   [ -n "$QGC_PLAN" ]     && mgr_args+=(-p "qgc_plan:=$QGC_PLAN")

@@ -133,6 +133,15 @@ class Guard:
                 grace = self.degrade_grace.get(st, 0.0)
                 if self.state == TAKEOFF and st in ('init_wait', 'no_frames'):
                     grace = self.takeoff_max_s   # MCL scans during the climb
+        # During the (bounded) climb the vehicle is on baro + EKF attitude;
+        # SchurVINS commonly reports vio=bad until the takeoff jerk and MCL
+        # cannot lock below ~44 m (coverage gate). Holding at 10 m on the
+        # first dropout (flight10/11/12 2026-09-29) left the drone fighting
+        # phantom states forever — tolerate EVERY degrade condition while
+        # TAKEOFF runs. The hard bounds below still apply: ev_stale below
+        # 10 m -> LAND (no velocity source at low alt) and takeoff_max_s.
+        if self.state == TAKEOFF and cond is not None:
+            return False, cond
         if cond is None:
             self.degrade = None
             self.degrade_since = None
@@ -202,8 +211,8 @@ class Guard:
                 go(LAND, 'takeoff_timeout')
             elif cond == 'ev_stale' and (alt or 0.0) < 10.0:
                 go(LAND, 'blind_low_alt')      # no EV = no velocity source
-            elif degraded and cond != 'init_wait':
-                go(HOLD, 'degraded:' + str(cond))
+            # degradation during climb is tolerated (bounded above) —
+            # do NOT drop to HOLD at 10 m when VIO/MCL are still warming up
         elif st == MISSION:
             if offboard_lost:
                 go(LAND, 'offboard_lost')
@@ -221,7 +230,13 @@ class Guard:
             elif mission_done:
                 go(LAND, 'mission_complete')   # stream ended while holding
             elif not degraded:
-                go(MISSION if not outside else RETURN, 'recovered')
+                # never start waypoint navigation below cruise altitude:
+                # resume the climb first (flight10-12 entered MISSION at
+                # ~10 m through false 'recovered' flaps)
+                if alt is not None and alt < self.cruise_alt - ALT_EPS_M:
+                    go(TAKEOFF, 'resume_climb')
+                else:
+                    go(MISSION if not outside else RETURN, 'recovered')
             elif self.hold_total > self.hold_budget_s:
                 go(LAND, 'hold_budget')
         elif st == RETURN:
