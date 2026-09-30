@@ -233,6 +233,34 @@ DR_GATE_MAX_S = 120.0   # s: beyond this lost window the DR reference is
                         # vacuous — gate skipped
 DR_GATE_MAX_BLOCKS = 3  # fully-blocked rescans before the gate gives up
                         # (a broken DR stream must not wedge recovery)
+# --- relocation verification gate (2026-09-30) -------------------------------
+# A/B/C/D layered gate against confident false re-locks (flights 05/09:
+# 0.98-1.0 lookalikes self-confirm in 10 frames and then own the track for
+# minutes; flight10-12 false-locked on the ground).
+# A: distance-scaled confirmation streak — a reseed hundreds of metres away
+#    from the independent DR reference must prove itself over MORE frames
+#    than a 5 m local re-lock. The cloud reseeds immediately; only the
+#    CONFIRMED anchor (and the single post-confirm EV jump allowance) waits.
+CONFIRM_M_PER_FRAME = 50.0   # +1 required frame per this much reseed jump
+CONFIRM_FRAMES_MAX = 20      # streak cap (~15-25 s at 0.8-1.4 Hz fixes)
+# B: while the hypothesis is pending it must stay consistent with its own
+#    reseed position propagated by the FCU-EKF velocity DR (independent of
+#    MCL yaw). Wandering farther than this off the DR track resets the
+#    streak — a stable lookalike stays put, a rotating/alternating one moves.
+CONFIRM_DRIFT_M = 45.0
+# C: post-confirm challenger. After CONFIRMING a jump larger than this, keep
+#    the pre-jump DR position alive as a competing hypothesis for a bounded
+#    window and score a small compass-steered grid around it every measured
+#    frame. It beating the locked track persistently forces a challenger-
+#    seeded rescan (replay_log reloc = 3) — converts "stuck forever" into
+#    "recovers when evidence returns" without trusting a single frame.
+CHALLENGE_JUMP_M = 100.0     # only big confirmations arm a challenger
+CHALLENGE_S = 120.0          # challenge window [s]
+CHALLENGE_GRID_M = 48.0      # 3x3 grid pitch (window +-96 m — covers the FCU
+                             # velocity DR error over the 120 s window)
+CHALLENGE_YAW_STEP = np.radians(10.0)   # 3-yaw grid around the compass heading
+CHALLENGE_MARGIN = 0.10      # challenger must beat the locked track by this
+CHALLENGE_FRAMES = 3         # ... for this many consecutive measured frames
 
 POSE_MAX_AGE = 0.15   # s: max |odomimu stamp - image stamp| for a match
 FCU_ALT_MAX_AGE = 1.0  # s: max |FCU altitude stamp - image stamp| (baro is
@@ -891,7 +919,17 @@ class MclNode(Node):
         self.reloc_fails = 0
         self.recovering = False           # a rescan hypothesis awaits CONFIRMATION
         self.recover_count = 0            # consecutive good frames since the rescan
+        self.recover_need = RECOVER_FRAMES  # streak required for current reseed (A)
         self.reseed_t = None              # time of the last (re)seeding
+        self.reseed_jump = 0.0            # best nominee vs pre-jump DR ref [m] (A)
+        self.reseed_xy = None             # seeded hypothesis xy at reseed [m] (B)
+        self.reseed_ref = None            # pre-jump DR position at reseed [m] (C)
+        # post-confirm challenger (C): (armed t0, pre-jump DR xy then, yaw)
+        self.chal_t0 = None
+        self.chal_xy0 = None
+        self.chal_yaw = None
+        self.chal_streak = 0
+        self.chal_last = None             # (best_grid, track_score, age_s)
         self.vio_map_rot = None           # EMA of the compass-observed VIO->map yaw
         self.scan_buf = deque()           # (t, patch, coverage, p_vio 2-tuple/None)
         self.local_rescan_t = deque()     # times of recent LOCAL rescans (evidence)
@@ -1527,6 +1565,122 @@ class MclNode(Node):
             return peaks
         return []
 
+    # --------------------------------------- relocation verification gate A/C
+    def _arm_recovery(self, t, peaks):
+        """Shared bookkeeping for EVERY reseed (point/scan init + local/global
+        rescans). Measures the jump of the best nominee from the independent
+        FCU-velocity DR reference, scales the required confirmation streak
+        (A), records the seeded hypothesis for the drift check (B) and the
+        pre-jump DR position for a possible challenger (C), and cancels any
+        challenger left over from a previous (wrong) confirmation."""
+        ref = None
+        if self.last_good is not None:
+            lg = self.last_good
+            if 0.0 < t - lg[3] <= DR_GATE_MAX_S:
+                dd = self.dr_displacement(lg[3], t)
+                if dd is not None:
+                    ref = (lg[0] + dd[0], lg[1] + dd[1])
+        sx, sy = float(peaks[0][1]), float(peaks[0][2])
+        jump = math.hypot(sx - ref[0], sy - ref[1]) if ref is not None else 0.0
+        self.reseed_jump = jump
+        self.reseed_xy = (sx, sy)
+        self.reseed_ref = ref
+        self.recover_need = min(
+            CONFIRM_FRAMES_MAX,
+            RECOVER_FRAMES + int(math.ceil(jump / CONFIRM_M_PER_FRAME)))
+        self.chal_t0 = None
+        self.chal_streak = 0
+        self.chal_last = None
+        self.recovering = True
+        self.recover_count = 0
+        self.reseed_t = t
+
+    def _reseed_dr_pred(self, t):
+        """The current reseed hypothesis position propagated to t with the
+        independent FCU-EKF velocity DR, or None. Used by confirmation drift
+        check (B). None ALSO at the INITIAL lock (no prior CONFIRMED fix):
+        point-init clouds legitimately converge 30-110 m in their first
+        frames while the drone hovers/climbs (flights 06/07), and an
+        est-jump there is honest convergence, not a wandering lookalike."""
+        if (self.reseed_t is None or self.reseed_xy is None
+                or self.reseed_ref is None):
+            return None
+        dt = t - self.reseed_t
+        if dt <= 0.0 or dt > DR_GATE_MAX_S:
+            return None
+        dd = self.dr_displacement(self.reseed_t, t)
+        if dd is None:
+            return None
+        return self.reseed_xy[0] + dd[0], self.reseed_xy[1] + dd[1]
+
+    def update_challenger(self, t, track_score, k, yaw_pred):
+        """Gate C: while a post-confirm challenger is armed, score a small
+        compass-steered 3x3x3 grid around the pre-jump DR track each measured
+        frame. If the challenger beats the locked track by CHALLENGE_MARGIN
+        for CHALLENGE_FRAMES consecutive frames, force a challenger-seeded
+        reseed (this row logged reloc=3) and return True. The grid uses FCU
+        velocity DR (yaw-independent) and the FCU compass heading, so the
+        check is independent of whichever map lock currently owns the cloud.
+        """
+        if self.chal_t0 is None:
+            return False
+        if t - self.chal_t0 > CHALLENGE_S:
+            self.chal_t0 = None
+            self.chal_streak = 0
+            self.chal_last = None
+            return False
+        dd = self.dr_displacement(self.chal_t0, t)
+        if dd is None:
+            return False
+        cx, cy = self.chal_xy0[0] + dd[0], self.chal_xy0[1] + dd[1]
+        yaw_c = yaw_pred if yaw_pred is not None else self.chal_yaw
+        if yaw_c is None:
+            return False
+        offs = (-CHALLENGE_GRID_M, 0.0, CHALLENGE_GRID_M)
+        yaws = (yaw_c - CHALLENGE_YAW_STEP, yaw_c, yaw_c + CHALLENGE_YAW_STEP)
+        cand = [(cx + ox, cy + oy, yw) for oy in offs for ox in offs
+                for yw in yaws]
+        parts = dict(
+            x=np.array([c[0] for c in cand], np.float32),
+            y=np.array([c[1] for c in cand], np.float32),
+            yaw=np.array([c[2] for c in cand], np.float32),
+            scale=np.ones(len(cand), np.float32))
+        s = self.mcl.score_particles(parts)
+        i = int(np.argmax(s))
+        best_s = float(s[i])
+        self.chal_last = (round(best_s, 3), round(float(track_score), 3),
+                         round(t - self.chal_t0, 1))
+        if best_s > float(track_score) + CHALLENGE_MARGIN:
+            self.chal_streak += 1
+        else:
+            self.chal_streak = 0
+        if self.chal_streak < CHALLENGE_FRAMES:
+            return False
+        # persistent evidence: force a reseed on the challenger peaks
+        bx, by = cand[i][0], cand[i][1]
+        self.get_logger().warn(
+            f'k={k}: CHALLENGER beat the locked track for '
+            f'{CHALLENGE_FRAMES} frames (grid {best_s:.3f} vs track '
+            f'{track_score:.3f} at ({bx:.0f},{by:.0f}) m) — forced '
+            f'challenger reseed')
+        order = np.argsort(s)[::-1]
+        peaks = []
+        for j in order:
+            px, py, yw = cand[j]
+            if all(math.hypot(px - q[1], py - q[2]) > 1.0 for q in peaks):
+                peaks.append((float(s[j]), px, py, yw))
+            if len(peaks) >= 3:
+                break
+        self.particles = particles_from_peaks(
+            self.mcl, peaks, self.n_particles,
+            std=(CHALLENGE_GRID_M, CHALLENGE_GRID_M, 0.10, 0.02))
+        self._arm_recovery(t, peaks)
+        self.log[-1]['reloc'] = 3
+        self.chal_t0 = None
+        self.chal_streak = 0
+        self.chal_last = None
+        return True
+
     def on_image(self, msg):
         if msg.encoding != 'mono8':
             self.get_logger().error(
@@ -1967,9 +2121,7 @@ class MclNode(Node):
                 self.particles = particles_from_peaks(
                     self.mcl, peaks, self.n_particles,
                     std=(max(15.0, step), max(15.0, step), 0.20, 0.03))
-                self.recovering = True
-                self.recover_count = 0
-                self.reseed_t = t
+                self._arm_recovery(t, peaks)
             else:
                 # scan init: WAIT until the buffer spans the validated
                 # SCAN_WINDOW_S (multi-frame nomination; the drone climbs
@@ -2054,9 +2206,7 @@ class MclNode(Node):
                     std = (30.0, 30.0, 0.30, 0.03)
                 self.particles = particles_from_peaks(
                     self.mcl, peaks, self.n_particles, std=std)
-                self.recovering = True
-                self.recover_count = 0
-                self.reseed_t = t
+                self._arm_recovery(t, peaks)
 
         # --- motion model: VIO while trustworthy, otherwise hover-diffuse.
         # On VIO failure/gap we propagate with zero translation + process
@@ -2191,11 +2341,58 @@ class MclNode(Node):
         # rescans — a descent through the coverage floor must not fire a
         # global scan on mushy scores).
         if not gated:
-            if scores.max() >= LOST_SCORE:
+            track_score = float(scores.max())
+            # Gate C runs only while a CONFIRMED lock owns the cloud (never
+            # while a hypothesis is pending); a fired challenger performs
+            # the reseed for this frame itself.
+            forced_reseed = False
+            if not self.recovering:
+                forced_reseed = self.update_challenger(
+                    t, track_score, k, self.yaw_pred_at(t))
+            if not forced_reseed and track_score >= LOST_SCORE:
                 self.lost_count = 0
                 if self.recovering:
-                    self.recover_count += 1
-                    if self.recover_count >= RECOVER_FRAMES:
+                    # Gate B: the pending hypothesis must stay on its own
+                    # reseed position propagated by the independent FCU
+                    # velocity DR — an alternating/rotating lookalike wanders
+                    # off that track and resets the jump-scaled (A) streak.
+                    pred = self._reseed_dr_pred(t)
+                    drift_m = (math.hypot(est['x'] - pred[0],
+                                          est['y'] - pred[1])
+                               if pred is not None else 0.0)
+                    if pred is None or drift_m <= CONFIRM_DRIFT_M:
+                        self.recover_count += 1
+                    else:
+                        if self.recover_count > 0:
+                            self.get_logger().info(
+                                f'k={k}: reseed hypothesis {drift_m:.0f} m '
+                                f'off the DR track — confirmation streak '
+                                f'reset ({self.recover_count}/'
+                                f'{self.recover_need})')
+                        self.recover_count = 0
+                    if self.recover_count >= self.recover_need:
+                        big = self.reseed_jump > CHALLENGE_JUMP_M
+                        # arm the challenger at the PRE-JUMP DR position of
+                        # THIS moment (old last_good + FCU velocity DR)
+                        if big:
+                            ref_now = None
+                            if self.last_good is not None:
+                                lg = self.last_good
+                                if 0.0 < t - lg[3] <= DR_GATE_MAX_S:
+                                    dd0 = self.dr_displacement(lg[3], t)
+                                    if dd0 is not None:
+                                        ref_now = (lg[0] + dd0[0],
+                                                   lg[1] + dd0[1])
+                            if ref_now is None:
+                                ref_now = pred
+                            if ref_now is not None:
+                                self.chal_t0 = t
+                                self.chal_xy0 = ref_now
+                                self.chal_yaw = (
+                                    self.yaw_pred_at(t)
+                                    or (self.last_good[2]
+                                        if self.last_good else est['yaw']))
+                                self.chal_streak = 0
                         self.recovering = False
                         self.recover_count = 0
                         self.reloc_fails = 0
@@ -2204,13 +2401,18 @@ class MclNode(Node):
                         # the confirmed reseed MAY jump the delivered EV
                         # stream once (it passed the DR plausibility gate)
                         self.ev_jump_ok = 2
+                        extra = (f'jump {self.reseed_jump:.0f} m, '
+                                 f'{self.recover_need} frames'
+                                 + (f', challenger armed {CHALLENGE_S:.0f} s'
+                                    if self.chal_t0 is not None else ''))
                         self.get_logger().info(
                             f'k={k}: recovery CONFIRMED at '
-                            f"({est['x']:.0f},{est['y']:.0f}) m — tracking")
+                            f"({est['x']:.0f},{est['y']:.0f}) m — tracking "
+                            f'({extra})')
                 else:
                     self.reloc_fails = 0
                     self.last_good = (est['x'], est['y'], est['yaw'], t, psi)
-            else:
+            elif not forced_reseed:
                 self.lost_count += 1
                 if self.recovering:
                     self.recover_count = 0   # strict consecutive streak
@@ -2338,9 +2540,7 @@ class MclNode(Node):
                 if peaks:
                     self.particles = particles_from_peaks(
                         self.mcl, peaks, self.n_particles, std=std)
-                    self.recovering = True
-                    self.recover_count = 0
-                    self.reseed_t = t
+                    self._arm_recovery(t, peaks)
                 self.lost_count = 0
 
     # ---------------------------------------------------------------- debug
@@ -2408,6 +2608,12 @@ class MclNode(Node):
         h['locals_recent'] = len(self.local_rescan_t)
         h['reloc_fails'] = self.reloc_fails
         h['recover_n'] = self.recover_count
+        h['confirm_need'] = self.recover_need      # gate A: streak target
+        h['reseed_jump_m'] = round(self.reseed_jump, 1)
+        h['chal'] = 0 if self.chal_t0 is None else 1   # gate C armed
+        if self.chal_last is not None:
+            h['chal_best'], h['chal_track'], h['chal_age_s'] = self.chal_last
+            h['chal_streak'] = self.chal_streak
         h['vio_jumps'] = self.vio_jumps
         self.health_pub.publish(String(data=json.dumps(h)))
 
